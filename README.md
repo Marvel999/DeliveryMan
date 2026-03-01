@@ -1,7 +1,7 @@
 # Rider Delivery Application — Offline-First Architecture
 ## Master Design Document (HLD + LLD)
 
-> **Platform:** Android Native | **Version:** 4.0
+> **Platform:** Android Native | **Version:** 10.0
 > **Last Updated:** This is the living document. All new sections are appended here.
 
 ---
@@ -55,7 +55,6 @@
 12. [Edge Case Handling](#12-edge-case-handling)
 13. [Trade-offs](#13-trade-offs)
 14. [Observability & Debugging](#14-observability--debugging)
-15. [AI Usage](#15-ai-usage)
 16. [Open Questions](#16-open-questions)
 17. [Storage Pressure & Emergency Cleanup](#17-storage-pressure--emergency-cleanup)
     - 17.1 The Problem
@@ -67,23 +66,62 @@
     - 17.7 UI — Progressive Pressure Communication
     - 17.8 How Emergency Cleanup Differs from Periodic Cleanup
     - 17.9 Full Pressure Scenario Walkthrough
+19. [Adaptive Sync Frequency](#19-adaptive-sync-frequency)
+    - 19.1 Why Fixed Periodic Is Wrong at Scale
+    - 19.2 Battery & Data Cost Analysis
+    - 19.3 Age-Based Adaptive Frequency Tiers
+    - 19.4 AdaptiveSyncScheduler Implementation
+    - 19.5 WorkManager Rescheduling Strategy
+    - 19.6 Constraint Layering
+    - 19.7 Interaction with Other Sync Triggers
+    - 19.8 Fleet-Level Impact
+    - 19.9 Trade-offs of Adaptive Sync
 18. [Conflict Resolution — Complete Coverage](#18-conflict-resolution--complete-coverage)
     - 18.1 Audit Summary
-    - 18.2 Duplicate Action Submission (Idempotency Conflict) ✅
-    - 18.3 Task Already Updated on Server ✅ Extended
-    - 18.4 Out-of-Order Actions ✅ New
-    - 18.5 Multiple Devices Conflict ✅ Extended
-    - 18.6 Task Reassigned While Offline ✅ New
-    - 18.7 Task Deleted on Server ✅ New
-    - 18.8 Partial Batch Sync Failure ✅
-    - 18.9 Clock Skew Conflict ✅ Extended
-    - 18.10 Optimistic Lock Version Conflict ✅ New
-    - 18.11 Retry After App Reinstall ✅ New
-    - 18.12 WorkManager Duplicate Execution ✅ Extended
-    - 18.13 Network Flapping ✅ New
-    - 18.14 Payload Too Large (Scale Conflict) ✅ New
-    - 18.15 Data Corruption in Local DB ✅ Extended
-    - 18.16 Security Conflict (Replay Attack) ✅ New
+    - 18.2 Duplicate Action Submission
+    - 18.3 Task Already Updated on Server
+    - 18.4 Out-of-Order Actions
+    - 18.5 Multiple Devices Conflict
+    - 18.6 Task Reassigned While Offline
+    - 18.7 Task Deleted on Server
+    - 18.8 Partial Batch Sync Failure
+    - 18.9 Clock Skew Conflict
+    - 18.10 Optimistic Lock Version Conflict
+    - 18.11 Retry After App Reinstall
+    - 18.12 WorkManager Duplicate Execution
+    - 18.13 Network Flapping
+    - 18.14 Payload Too Large
+    - 18.15 Data Corruption in Local DB
+    - 18.16 Security Conflict (Replay Attack)
+    - 18.17 Decision Matrix
+20. [QR Scan Validation](#20-qr-scan-validation)
+    - 20.1 All Wrong-QR Scenarios
+    - 20.2 Validation Architecture — Two Layers
+    - 20.3 Layer 1: Client-Side Structural Validation
+    - 20.4 Layer 2: Server-Side Semantic Validation
+    - 20.5 QrValidationUseCase — Full Decision Tree
+    - 20.6 Wrong QR Scenario Handling (All 8 Cases)
+    - 20.7 Offline Validation Behaviour
+    - 20.8 Scan Audit Log
+    - 20.9 UI Feedback per Rejection Reason
+    - 20.10 Decision Matrix
+21. [Sync Event Logging & Observability](#21-sync-event-logging--observability)
+    - 21.1 The Problem — Silent Failures
+    - 21.2 What Constitutes a Sync Event
+    - 21.3 SyncEvent Schema
+    - 21.4 All Loggable Sync Failure Points
+    - 21.5 SyncEventLogger Implementation
+    - 21.6 Local Buffer — Log Before You Send
+    - 21.7 Backend Ingest Endpoint
+    - 21.8 SyncManager — Fully Instrumented
+    - 21.9 Alerting Rules on Backend
+    - 21.10 Dashboard Metrics
+    - 21.11 Trade-offs
+22. [Testing Plan & Phased Release](#22-testing-plan--phased-release)
+    - 22.1 What to Test and Why
+    - 22.2 Unit Tests
+    - 22.3 Integration Tests
+    - 22.4 E2E Tests
 
 ---
 
@@ -462,17 +500,35 @@ For each shipment from backend response:
 │      ConnectivityManager.NetworkCallback.onAvailable()        │
 │                                                               │
 │  T3: After every rider action                                 │
-│      Count PENDING in journal                                 │
-│      ≥ 5 → sync immediately + show banner to rider            │
+│      Always fires. Attempts sync immediately.                 │
+│      Role: "sync what I just did"                             │
+│      ≥ 5 pending → also show banner to rider                  │
 │                                                               │
-│  T4: Periodic fallback (safety net)                           │
-│      PeriodicWorkRequest every 15 minutes                     │
-│      Catches any missed T1/T2/T3 triggers                     │
+│  T4: Stuck-state detector (NOT a sync driver)                 │
+│      Only fires when T1 + T2 + T3 have all had a fair chance  │
+│      and PENDING entries are still sitting unsynced.          │
+│      Role: "catch what T3/T2/T1 missed"                       │
+│                                                               │
+│      Signal used: AGE of oldest PENDING entry, not count.     │
+│      Count = how much work. Age = whether system already      │
+│      had a fair chance to handle it.                          │
+│                                                               │
+│      0 PENDING              → NONE (cancel periodic)          │
+│      PENDING, oldest < 5min → NONE (T3 just fired, wait)      │
+│      PENDING, oldest > 5min → 15 min (stuck detector active)  │
+│      PENDING, oldest > 30min→ 5 min  (escalate)               │
+│      PENDING, oldest > 2hrs → 1 min  (urgent + event log)     │
 │                                                               │
 │  All triggers → WorkManager.enqueueUniqueWork("SYNC", KEEP)   │
 │  KEEP policy → no duplicate sync jobs ever run in parallel    │
 └───────────────────────────────────────────────────────────────┘
 ```
+
+> **Why is T4 still needed if T3 exists?** T3 fires on rider actions. If sync
+> fails mid-batch and the rider stops working (phone in pocket), no more actions
+> = no more T3. T1 fires on foreground, T2 on network reconnect — but T2 is
+> unreliable on some OEMs. T4 is the backstop for stuck PENDING entries that
+> T3/T2/T1 structurally cannot reach. See Section 19 for full design.
 
 ### 6.2 Journal Entry State Lifecycle
 
@@ -1131,18 +1187,254 @@ Offset is fetched once per app session. Battery-efficient. Prevents timestamp ta
 
 ### 10.2 Connectivity Observer
 
+**The problem with `ConnectivityManager` alone:**
+
+`NetworkCallback.onAvailable()` fires when the device joins a network — Wi-Fi,
+mobile data, ethernet. It does **not** mean the internet is actually reachable.
+
+```
+Cases where isConnected = true but internet = false:
+  ─────────────────────────────────────────────────
+  Captive portal (hotel/airport Wi-Fi — connected but all traffic blocked
+                  until login page is submitted)
+  Mobile data with zero balance
+  ISP DNS working but routing broken
+  Network interface up but carrier signal too weak to pass packets
+  Corporate proxy that intercepts all traffic
+```
+
+If `ConnectivityObserver` only wraps `NetworkCallback`, the SyncManager will
+attempt sync on a dead connection, get an `IOException`, retry, and loop —
+while the UI incorrectly shows "online." The rider sees the spinner and nothing
+happens.
+
+**The fix — two-layer connectivity check:**
+
+```
+Layer 1: ConnectivityManager.NetworkCallback
+  → Fast. Event-driven. Zero battery cost.
+  → Answers: "is a network interface connected?"
+  → Used for: triggering T2 sync, fast UI updates
+
+Layer 2: Active reachability probe (HTTP HEAD)
+  → Runs after Layer 1 reports connected.
+  → Answers: "can we actually reach our backend?"
+  → Used for: gating actual sync attempts
+```
+
+**Why our own backend, not google.com:**
+
+```
+google.com is blocked in some regions (China, certain enterprise networks).
+google.com up ≠ our backend up — would mask real backend outages.
+We already have a /v1/ping endpoint — reusing it is free and gives
+us two signals in one: internet works AND our server is reachable.
+
+google.com is used as a fallback — if our server fails the probe but
+google.com succeeds, the problem is our backend, not the internet.
+This distinction matters for ops alerting.
+```
+
 ```kotlin
-class ConnectivityObserver @Inject constructor(private val context: Context) {
-    val isOnline: StateFlow<Boolean> = callbackFlow {
+enum class ConnectivityState {
+    OFFLINE,              // No network interface connected
+    CONNECTED_UNVERIFIED, // Network connected, reachability not yet confirmed
+    ONLINE,               // Network connected + probe succeeded
+    CAPTIVE_PORTAL        // Network connected but probe redirected (HTTP != 200)
+}
+
+class ConnectivityObserver @Inject constructor(
+    private val context: Context,
+    private val httpClient: OkHttpClient
+) {
+    private val _state = MutableStateFlow(ConnectivityState.OFFLINE)
+    val state: StateFlow<ConnectivityState> = _state.asStateFlow()
+
+    // Convenience — existing callers only care about ONLINE vs not
+    val isOnline: Boolean get() = _state.value == ConnectivityState.ONLINE
+
+    private val probeScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    init {
+        registerNetworkCallback()
+    }
+
+    // ── Layer 1: ConnectivityManager callback ──────────────────────────
+    private fun registerNetworkCallback() {
         val mgr = context.getSystemService(ConnectivityManager::class.java)
         val cb  = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) { trySend(true)  }
-            override fun onLost(network: Network)      { trySend(false) }
+
+            override fun onAvailable(network: Network) {
+                // Network interface is up — but don't claim ONLINE yet
+                _state.value = ConnectivityState.CONNECTED_UNVERIFIED
+                // Layer 2: confirm actual reachability
+                probeScope.launch { probe() }
+            }
+
+            override fun onLost(network: Network) {
+                _state.value = ConnectivityState.OFFLINE
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                caps: NetworkCapabilities
+            ) {
+                // Android 10+: VALIDATED means OS already confirmed internet
+                // Use it as a fast path — skip our probe if OS validated
+                if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                    _state.value = ConnectivityState.ONLINE
+                }
+            }
         }
-        mgr.registerDefaultNetworkCallback(cb)
-        awaitClose { mgr.unregisterNetworkCallback(cb) }
-    }.stateIn(CoroutineScope(Dispatchers.IO), SharingStarted.Eagerly, initialValue = false)
+
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        mgr.registerNetworkCallback(request, cb)
+    }
+
+    // ── Layer 2: Active reachability probe ─────────────────────────────
+    suspend fun probe(): ConnectivityState {
+        val result = probeOurBackend() ?: probeGoogleFallback()
+
+        _state.value = result
+        return result
+    }
+
+    private suspend fun probeOurBackend(): ConnectivityState? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val response = httpClient.newCall(
+                    Request.Builder()
+                        .url("https://api.ourdelivery.com/v1/ping")
+                        .head()                          // HEAD — no body, minimal bytes
+                        .header("Cache-Control", "no-cache")
+                        .build()
+                ).execute()
+
+                when (response.code) {
+                    200  -> ConnectivityState.ONLINE
+                    302,
+                    301  -> ConnectivityState.CAPTIVE_PORTAL  // redirect = portal
+                    else -> null   // unexpected — fall through to Google probe
+                }
+            } catch (e: IOException) {
+                null  // our server unreachable — try Google to separate internet vs backend issue
+            }
+        }
+    }
+
+    private suspend fun probeGoogleFallback(): ConnectivityState {
+        return withContext(Dispatchers.IO) {
+            try {
+                val response = httpClient.newCall(
+                    Request.Builder()
+                        .url("https://www.google.com")
+                        .head()
+                        .header("Cache-Control", "no-cache")
+                        .build()
+                ).execute()
+
+                when (response.code) {
+                    200  -> {
+                        // Google reachable but our backend wasn't
+                        // → internet works, OUR BACKEND IS DOWN
+                        // Log this as a backend outage signal
+                        eventLogger.log(
+                            eventType    = SyncEventType.SYNC_FAILED,
+                            severity     = SyncEventSeverity.ERROR,
+                            errorCode    = "BACKEND_UNREACHABLE",
+                            errorMessage = "Google reachable but /v1/ping failed"
+                        )
+                        // Still return OFFLINE from sync's perspective —
+                        // our backend is down so sync will fail anyway
+                        ConnectivityState.OFFLINE
+                    }
+                    else -> ConnectivityState.CAPTIVE_PORTAL
+                }
+            } catch (e: IOException) {
+                ConnectivityState.OFFLINE   // neither backend nor Google reachable
+            }
+        }
+    }
 }
+```
+
+**Probe configuration on the OkHttpClient:**
+
+```kotlin
+// Injected via Hilt — separate from the main API client
+// Short timeouts: probe should fail fast, not block sync for 30 seconds
+@Provides @Named("probe")
+fun provideProbeHttpClient(): OkHttpClient = OkHttpClient.Builder()
+    .connectTimeout(3, TimeUnit.SECONDS)   // fail fast
+    .readTimeout(3, TimeUnit.SECONDS)
+    .writeTimeout(3, TimeUnit.SECONDS)
+    .followRedirects(false)                // detect captive portals (they redirect)
+    .build()
+```
+
+**`followRedirects(false)` is critical for captive portal detection.** A captive
+portal intercepts the request and returns a 302 redirect to its login page.
+If we follow redirects, we'd GET the login page, get a 200, and incorrectly
+think we're online. With redirects disabled, we see the 302 directly and
+correctly classify it as `CAPTIVE_PORTAL`.
+
+**How `ConnectivityState.CAPTIVE_PORTAL` is used:**
+
+```kotlin
+// In SyncOrchestrator — gate sync behind ONLINE, not just CONNECTED
+fun onNetworkAvailable() {
+    if (connectivity.state.value != ConnectivityState.ONLINE) return
+    triggerSync()
+}
+
+// In UI — show captive portal prompt
+when (connectivity.state.value) {
+    ConnectivityState.CAPTIVE_PORTAL -> {
+        // Show banner: "Connected to Wi-Fi but internet is blocked.
+        //               Tap to open login page."
+        // Deep link to: Settings → Wi-Fi → captive portal page
+    }
+    ConnectivityState.OFFLINE -> { /* offline banner */ }
+    ConnectivityState.ONLINE  -> { /* normal */ }
+    ConnectivityState.CONNECTED_UNVERIFIED -> { /* probing... */ }
+}
+```
+
+**`NET_CAPABILITY_VALIDATED` fast path (Android 10+):**
+
+Android's OS validates internet connectivity itself on API 29+. When
+`onCapabilitiesChanged` fires with both `INTERNET` and `VALIDATED` capabilities,
+the OS has already confirmed real internet access — we can skip our probe entirely
+and go straight to `ONLINE`. Our probe only runs on older Android versions or
+when the OS validation hasn't fired yet.
+
+**Probe frequency — when does it run:**
+
+```
+Trigger                          Probe runs?   Reason
+─────────────────────────────────────────────────────────────────────
+onAvailable() fires              Yes           New network, must verify
+onCapabilitiesChanged (VALIDATED)No            OS already confirmed, trust it
+T2 sync trigger                  Only if UNVERIFIED  Don't re-probe if already ONLINE
+Explicit retry by user           Yes           Manual "Retry" button triggers probe
+App foreground (T1)              Only if OFFLINE/UNVERIFIED  Don't probe every foreground
+─────────────────────────────────────────────────────────────────────
+```
+
+**The two-signal value of Google as fallback:**
+
+```
+Our backend probe fails + Google probe fails → OFFLINE (internet is down)
+Our backend probe fails + Google probe works → our backend is DOWN, internet fine
+Our backend probe works                      → ONLINE
+
+This gives ops two different alerts:
+  "Rider offline" → internet problem, ops cannot help
+  "Backend unreachable" → our infra problem, ops must act immediately
+```
 ```
 
 ### 10.3 MVI Pattern — Task Feature
@@ -1266,25 +1558,16 @@ Response: {
 
 ## 12. Edge Case Handling
 
-| Scenario | Handling |
+All edge cases are documented in full detail in their respective sections. This table is intentionally kept as a quick-reference index.
+
+| Category | See Section |
 |---|---|
-| **App crash during action write** | Startup recovery resets IN_PROGRESS → PENDING; sync resumes on next launch |
-| **Duplicate taps (e.g., "Delivered" × 3 quickly)** | Button disabled after first tap + 300ms UI debounce + backend idempotency via action_id |
-| **Conflict: Rider marks Delivered, server shows Cancelled** | Backend wins; app shows "Conflict — Contact Support" screen after sync |
-| **5+ unsynced actions** | Show blocking alert; restrict further offline delivery actions; pickup remains unrestricted |
-| **OEM background kill (Xiaomi/Redmi/Samsung)** | WorkManager foreground service + exponential backoff + T4 periodic fallback |
-| **Barcode scanner failure** | Fallback to manual shipment ID entry with backend validation |
-| **Multiple riders claim same shipment** | Backend enforces unique assignment; returns `ALREADY_CLAIMED` on sync; app shows conflict |
-| **Order cancelled while rider is en route** | FCM push notification → local DB update → delivery completion blocked |
-| **Phone storage full** | Monitor bytes available; alert rider; block image capture if critically low |
-| **Time manipulation by rider** | NTP offset: all timestamps use server-calibrated time; device clock never trusted |
-| **Partial batch sync failure** | Per-record failure marking; failed records retried independently; others continue |
-| **Room DB corrupted** | Catch `SQLiteException` on open → export journal via emergency HTTP → prompt reinstall |
-| **App uninstalled before sync** | Backend TTL monitor: flag riders with in-flight shipments and no incoming actions for >N hours |
-| **Two devices, same rider ID** | Backend invalidates older session token; app detects 401 → re-authenticate |
-| **Offline version incompatibility** | API versioning; restrict operations on schema mismatch; force update on network restore |
-| **UNVERIFIED_PICKUP rejected after sync** | Mark as REJECTED in DB; notify rider; task is never silently deleted |
-| **NTP offset stale (very long session)** | Re-fetch server time on every app foreground event |
+| Sync conflicts (duplicate, out-of-order, version, clock skew, replay) | §18 |
+| Storage full, emergency cleanup | §17 |
+| OEM kills, WorkManager, network flapping | §6.6, §18.12, §18.13, §19 |
+| QR scan failures, wrong parcel, damaged label | §20 |
+| Silent sync failures, crash recovery, DB corruption | §6.5, §18.15, §21 |
+| Offline write-block threshold (open) | §16 |
 
 ---
 
@@ -1300,7 +1583,7 @@ Response: {
 | **Strict state machine** | Prevents invalid transitions at every layer | More validation logic; stricter UX |
 | **WorkManager foreground service** | Survives OEM battery kills | Persistent sync notification (minor UX friction) |
 | **NTP offset (fetch once per session)** | Battery-efficient; no repeated network calls | Minor time drift in very long sessions; mitigated by re-fetching on foreground |
-| **5-action offline restriction** | Limits maximum data loss window | Can frustrate riders in persistent deep-offline zones |
+| **Offline write restriction threshold** | Limits data loss window | Threshold and policy unresolved — see §16 Open Questions |
 | **Action journal as sync driver** | Full audit trail; replay capability; decoupled from UI | Additional table to maintain; cleanup logic required |
 | **UNVERIFIED_PICKUP for offline task creation** | Never blocks rider workflow | Phantom tasks appear until sync resolves them |
 | **2-day DB retention post-sync** | Rider can review recent history | DB grows until cleanup runs; 1000+ shipments × 2 days can be significant |
@@ -1310,47 +1593,12 @@ Response: {
 
 ## 14. Observability & Debugging
 
-### Local (In-App Debug)
-- Action journal table is fully queryable — support team can pull pending/failed actions remotely
-- Sync status visible to rider via banner ("3 actions pending sync")
-- Hidden debug screen (long-press app version) shows journal log, sync history, NTP offset
+Full observability design — event schema, local buffer, backend ingest endpoint, alerting rules, and dashboard metrics — is in **Section 21**.
 
-### Backend / Remote
-- Every action carries `action_id`, `rider_id`, `timestamp` — complete audit trail
-- Backend logs all rejected state transitions → alert on-call team
-- Sync latency per rider: `synced_at - created_at` (track p50 / p95 / p99)
-- Failed sync rate per rider cohort → flag riders stuck offline > 30 min
-
-### Crash & ANR
-- Firebase Crashlytics integration
-- Custom breadcrumb logging: each state transition + sync trigger is a breadcrumb event
-
-### Metrics to Monitor
-- Pending journal entries per rider (alert ops if > 20)
-- Sync success rate (target > 99.5%)
-- Average time-to-sync per action
-- Image upload failure rate
-- State conflict rate (Delivered vs Cancelled)
-- UNVERIFIED_PICKUP rejection rate (signals barcode/ID quality issue)
-- DB size per rider (alert if > 50 MB)
-
----
-
-## 15. AI Usage
-
-| Tool | How Used |
-|---|---|
-| **Claude (Anthropic)** | Architecture brainstorming, trade-off analysis, Kotlin code scaffolding (SyncManager, StateMachine, MVI, cursor pagination) |
-| **GitHub Copilot** | Boilerplate generation: DAO interfaces, Room entities, Hilt modules, WorkManager worker setup |
-| **ChatGPT** | Edge case enumeration, OEM kill strategy review |
-
-**Designed by engineer:**
-Overall architecture layers, state machine transition rules, sync trigger strategy, conflict resolution policy, NTP offset approach, 3-section list structure, UNVERIFIED_PICKUP state concept, cleanup eligibility rules, module structure.
-
-**Accelerated with AI:**
-Kotlin code snippets, SQL schema drafts, WorkManager/Paging 3 boilerplate, API contract JSON structure.
-
-**All AI output was reviewed and domain-adapted** — particularly the Mutex SyncManager guard, startup recovery logic, cursor pagination DAO query, and the UNVERIFIED_PICKUP sync resolution flow.
+Quick reference:
+- Local debug screen: long-press app version → shows journal log, sync history, NTP offset
+- Crashlytics breadcrumbs on every state transition and sync trigger
+- Target metrics: sync success rate > 99.5%, p95 time-to-sync, RETRY_EXHAUSTED count = 0
 
 ---
 
@@ -1365,6 +1613,136 @@ Kotlin code snippets, SQL schema drafts, WorkManager/Paging 3 boilerplate, API c
 | Rider in offline zone for > 24 hrs? | After 5 unsynced deliveries: restrict. Ops team alerted via backend monitoring. If GPS available, use last known ping |
 | UNVERIFIED_PICKUP: what if rider performs 10 offline pickups and 8 are rejected? | Each is independently resolved on sync. Rejected tasks show clearly in list with "Contact Support". No cascading failure |
 | NTP offset: what if server time fetch fails on launch? | Fall back to last persisted offset from `ntp_offset` table. If no offset available, use device time with a warning logged |
+
+---
+
+### Open Question: Should write operations be blocked when pending sync count > 5 (post-Pickup state)?
+
+**The question precisely:**
+Once a rider has picked up a shipment (state = `PICKED_UP` or beyond), should the
+app block further state transitions — OUT_FOR_DELIVERY, DELIVERED, FAILED — if
+there are already 5 or more unsynced actions sitting in the journal?
+
+**Why this question is genuinely hard:**
+It sits at the intersection of data integrity, rider operations, and user trust.
+Neither "always block" nor "never block" is clearly right.
+
+---
+
+**Case FOR blocking (hard restriction):**
+
+```
+1. Data loss window is bounded
+   Each unsynced action is a delivery event that only exists on one device.
+   If the device is lost, stolen, or crashes, those 5+ events are gone.
+   Blocking forces the rider to sync before accumulating more risk.
+
+2. Backend state divergence is capped
+   With 5+ unsynced transitions, the backend's view of SHP123 is
+   potentially 5 states behind. If ops reassigns the shipment, cancels it,
+   or another system acts on it, the conflicts compound with each
+   additional unsynced action.
+
+3. Compliance and proof-of-delivery
+   In COD (Cash on Delivery) shipments, DELIVERED is a financial event.
+   If 5 COD deliveries are unsynced, the financial reconciliation is broken.
+   A hard block ensures financial events are anchored to a sync point.
+
+4. Rider accountability
+   If a rider marks 20 deliveries offline and 10 are disputed by recipients,
+   there is no server-side timestamp trail. Blocking at 5 creates regular
+   sync checkpoints that provide an audit trail.
+```
+
+**Case AGAINST blocking (soft warning only):**
+
+```
+1. Riders operate in real dead zones
+   Delivery routes through tunnels, basements, rural areas, industrial
+   estates can have zero signal for hours. Blocking mid-route means
+   the rider physically cannot complete their shift even when doing
+   everything correctly. Operations halt for an infrastructure problem.
+
+2. The data is safe on-device
+   Room DB with WAL mode is durable. The 5 unsynced actions are not
+   "at risk" unless the device itself is lost. Blocking to prevent
+   data loss is overly conservative — the data exists, it just hasn't
+   been confirmed by the server yet.
+
+3. Blocking creates worse workarounds
+   If riders are blocked, they will find ways around it — clearing app
+   data, logging out and back in, using paper notes. These workarounds
+   create more data integrity problems than the offline actions themselves.
+
+4. The threshold is arbitrary
+   Why 5? A rider doing 100 deliveries/day might hit 5 unsynced actions
+   in 10 minutes in a weak signal area. The threshold doesn't map to any
+   real risk boundary — it just creates friction.
+```
+
+**The nuanced middle ground — state-aware selective restriction:**
+
+Rather than a blanket count-based block, restrict based on **which states** are
+unsynced and **what the rider is trying to do next:**
+
+```
+Unsynced action type         Next action attempted     Allow?
+──────────────────────────────────────────────────────────────────────
+PICKUP actions (any count)   PICKUP (new shipment)     ✅ Always allow
+                             OUT_FOR_DELIVERY           ✅ Allow (same shipment chain)
+                             DELIVERED / FAILED         ⚠️ Warn at 5+, don't block
+
+DELIVERED / FAILED (COD)     Any new action             🔴 Block at 3+ unsynced COD
+(financial events)                                          events specifically
+
+DELIVERED / FAILED (non-COD) Any new action             ⚠️ Warn at 10+, don't block
+
+Any type, offline > 2 hours  DELIVERED / FAILED         ⚠️ Strong warning + "Sync now"
+                                                            but don't hard block
+──────────────────────────────────────────────────────────────────────
+```
+
+**Proposed direction (to be validated with ops team):**
+
+Apply a **two-tier response** rather than a binary block:
+
+```
+Tier 1 — WARNING (5–9 unsynced post-pickup actions):
+  Show persistent banner: "5 deliveries waiting to sync. Connect to sync now."
+  Allow all actions. No friction on task completion.
+  T4 adaptive sync escalates to 5-minute interval (Section 19).
+
+Tier 2 — SOFT BLOCK (10+ unsynced post-pickup actions, OR 3+ unsynced COD):
+  Show blocking modal before each new DELIVERED / FAILED action.
+  Modal has [Sync Now] and [Continue Anyway] options.
+  "Continue Anyway" is available but requires explicit acknowledgement.
+  Ops is alerted via OFFLINE_BUILDUP sync event (Section 21).
+  Rider is never fully stopped — they can override with awareness.
+
+Hard block:
+  Only if device storage is critically low (Section 17 SEVERE level).
+  Not based on pending count alone.
+```
+
+**Key questions for the ops/product team to resolve:**
+
+```
+1. What is the actual data loss incident rate from offline action accumulation?
+   If it's < 0.01%, a hard block is worse than the problem it solves.
+
+2. Are COD deliveries tracked separately in the financial system?
+   If yes, they warrant stricter treatment than non-COD.
+
+3. What do riders do today when they lose signal mid-route?
+   Their workaround behaviour defines the real constraint.
+
+4. Is there a contractual SLA on proof-of-delivery timestamp accuracy?
+   If so, that SLA defines the maximum allowable offline window,
+   which maps directly to the threshold.
+```
+
+**This question should remain open until real field data from rider behaviour
+and ops incident reports is available. Do not set the threshold by intuition.**
 
 ---
 
@@ -1773,16 +2151,461 @@ T=24h   1000 deliveries, all unsynced, all have images.
         Back to NORMAL.
 ```
 
+
 ---
 
-*This is the living master document. All new design decisions and clarifications are added as new sections here.*
-*Platform: Android Native | Architecture: MVI + Clean + Offline-First | Version: 4.0*
+## 19. Adaptive Sync Frequency
+
+### 19.1 Why Fixed Periodic Is Wrong at Scale — And Why Count Is Also the Wrong Signal
+
+The original T4 trigger was a `PeriodicWorkRequest` firing every 15 minutes.
+Section 19 then improved this to an adaptive interval driven by **pending count**.
+Both are better than a fixed periodic, but count is still not the right signal
+for T4's actual job.
+
+**The insight from Section 6.1:** T3 and T4 have fundamentally different roles.
+
+```
+T3 = sync driver      fires on rider action → "sync what I just did"
+T4 = stuck detector   fires on time        → "catch what T3/T2/T1 missed"
+```
+
+If T4's job is to detect **stuck** PENDING entries — entries that T3 already
+tried to sync but couldn't — then the right question to ask is not
+"how many PENDING entries are there?" but
+**"how long have PENDING entries been sitting here without being synced?"**
+
+```
+Why count is wrong as the sole T4 signal:
+
+  Scenario A: Rider records 20 actions, all synced immediately by T3.
+              Count = 0. T4 does nothing. ✅ Correct.
+
+  Scenario B: Rider records 3 actions, sync fails (network drops),
+              rider puts phone in pocket for 45 minutes.
+              Count = 3. Count-based T4 says: "low urgency, 30-min interval."
+              But oldest entry is 45 minutes old — something is stuck.
+              Age-based T4 says: "escalate to 5-min interval." ✅ More correct.
+
+  Scenario C: Rider records 50 actions in quick succession (hub sorting scan),
+              T3 syncs them all successfully in seconds.
+              Count-based T4 sees 50 mid-flight and schedules a 1-min periodic
+              that fires to find everything already SYNCED. Wasted wake-up.
+              Age-based T4: entries are < 5 min old, T3 just ran, no periodic
+              scheduled. ✅ More correct.
+```
+
+**The right signal for T4: age of the oldest PENDING entry.**
+Count is still useful — but as a severity amplifier within a tier, not the
+primary axis.
+
+---
+
+### 19.2 Battery & Data Cost Analysis
+
+Understanding the cost of each sync wake-up:
+
+```
+Per sync wake-up cost breakdown:
+────────────────────────────────────────────────────────────────
+Component              Empty sync       Sync with 10 actions
+──────────────────────────────────────────────────────────────
+WorkManager wake-up    ~5ms CPU         ~5ms CPU
+DB query (PENDING)     ~2ms, ~0KB       ~2ms, ~1KB
+API call (if pending)  not made         ~80ms, ~5KB up/down
+DB writes (SYNCED)     not made         ~3ms, ~1KB
+Total CPU time         ~7ms             ~90ms
+Total data             ~0 KB            ~6 KB
+Battery (est.)         ~0.002 mAh       ~0.04 mAh
+────────────────────────────────────────────────────────────────
+
+Empty syncs are cheap individually but compound badly at fleet scale.
+720,000 empty wakes/day × 0.002 mAh = 1,440 mAh wasted fleet-wide per day.
+That's ~1.4 full phone batteries drained doing nothing, every day.
+
+Data cost (metered connections matter for riders):
+  Fixed 15-min: 96 periodic checks/day × ~0.5KB overhead = ~48 KB/day/rider
+  Age-adaptive: ~8 checks/day average  × ~0.5KB           = ~4 KB/day/rider
+  Fleet saving: 10,000 × 44 KB/day = ~440 MB/day saved
+```
+
+**For riders on metered mobile data in cost-sensitive markets, this matters.**
+
+---
+
+### 19.3 Age-Based Adaptive Frequency Tiers
+
+T4 interval is determined by **how long the oldest PENDING entry has been
+waiting**, recalculated after every sync attempt and every rider action.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                  T4 STUCK-DETECTOR — AGE-BASED TIERS                  │
+│                                                                        │
+│  Condition                          Interval  Rationale                │
+│  ──────────────────────────────────────────────────────────────────    │
+│  No PENDING entries                 NONE      Nothing to detect.       │
+│                                               Cancel any scheduled T4. │
+│                                                                        │
+│  PENDING exist,                     NONE      T3 just ran. Give it     │
+│  oldest entry < 5 min old                     a fair chance before     │
+│                                               T4 interferes.           │
+│                                                                        │
+│  PENDING exist,                     15 min    Entries are stuck past   │
+│  oldest 5 – 30 min old                        T3's window. T4 activates│
+│                                               as a quiet backstop.     │
+│                                                                        │
+│  PENDING exist,                     5 min     Something is wrong.      │
+│  oldest 30 min – 2 hrs old                    T2 may have misfired.    │
+│                                               Escalate frequency.      │
+│                                                                        │
+│  PENDING exist,                     1 min     Urgent. Fire             │
+│  oldest > 2 hours                             OFFLINE_BUILDUP event.   │
+│                                               Show rider banner.       │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Count as a severity amplifier (secondary signal):**
+
+Within the `oldest > 30 min` and `oldest > 2 hrs` tiers, count adjusts the
+battery constraint — if count is also high (> 20), relax `BATTERY_NOT_LOW`
+because data loss risk outweighs battery cost.
+
+```
+oldest > 2 hrs AND count > 20  → 1-min interval, no battery constraint
+oldest > 2 hrs AND count ≤ 20  → 1-min interval, keep battery constraint
+oldest 30min–2hrs AND count > 20 → 5-min interval, relax battery constraint
+```
+
+---
+
+### 19.4 AdaptiveSyncScheduler Implementation
+
+```kotlin
+class AdaptiveSyncScheduler @Inject constructor(
+    private val workManager: WorkManager,
+    private val journalDao: ActionJournalDao,
+    private val ntpTime: NtpTimeProvider
+) {
+    companion object {
+        private const val WORK_TAG_PERIODIC = "ADAPTIVE_SYNC_PERIODIC"
+
+        // Age thresholds (milliseconds)
+        private val AGE_GRACE     = TimeUnit.MINUTES.toMillis(5)   // T3 just ran, wait
+        private val AGE_STUCK     = TimeUnit.MINUTES.toMillis(30)  // something is stuck
+        private val AGE_URGENT    = TimeUnit.HOURS.toMillis(2)     // serious problem
+
+        // Intervals (minutes)
+        private const val INTERVAL_BACKSTOP  = 15L   // PeriodicWorkRequest-safe
+        private const val INTERVAL_ESCALATED = 5L    // OneTimeWorkRequest chain
+        private const val INTERVAL_URGENT    = 1L    // OneTimeWorkRequest chain
+
+        // Count threshold for battery constraint relaxation
+        private const val COUNT_HIGH = 20
+    }
+
+    /**
+     * Called after every rider action and after every sync completion.
+     * Re-evaluates age of oldest PENDING entry and reschedules T4 accordingly.
+     */
+    suspend fun reschedule() {
+        val oldestPendingAge = journalDao.oldestPendingAgeMs(ntpTime.currentTimeMs())
+        val pendingCount     = journalDao.countPending()
+        val tier             = resolveTier(oldestPendingAge)
+
+        when (tier) {
+            SyncTier.NONE -> {
+                workManager.cancelAllWorkByTag(WORK_TAG_PERIODIC)
+            }
+            SyncTier.BACKSTOP -> {
+                // 15-min PeriodicWorkRequest — WorkManager native
+                schedulePeriodicWork(
+                    intervalMinutes  = INTERVAL_BACKSTOP,
+                    relaxBattery     = false
+                )
+            }
+            SyncTier.ESCALATED -> {
+                scheduleOneTimeWork(
+                    delayMinutes = INTERVAL_ESCALATED,
+                    relaxBattery = pendingCount > COUNT_HIGH
+                )
+            }
+            SyncTier.URGENT -> {
+                scheduleOneTimeWork(
+                    delayMinutes = INTERVAL_URGENT,
+                    relaxBattery = pendingCount > COUNT_HIGH
+                )
+                // Also fire OFFLINE_BUILDUP event if not already fired recently
+                eventLogger.log(
+                    eventType    = SyncEventType.OFFLINE_BUILDUP,
+                    severity     = SyncEventSeverity.WARN,
+                    pendingCount = pendingCount,
+                    errorMessage = "Oldest PENDING entry is ${oldestPendingAge / 60_000} minutes old"
+                )
+            }
+        }
+    }
+
+    private fun resolveTier(oldestPendingAgeMs: Long?): SyncTier = when {
+        oldestPendingAgeMs == null              -> SyncTier.NONE       // nothing pending
+        oldestPendingAgeMs < AGE_GRACE          -> SyncTier.NONE       // T3 just ran, wait
+        oldestPendingAgeMs < AGE_STUCK          -> SyncTier.BACKSTOP   // quiet backstop
+        oldestPendingAgeMs < AGE_URGENT         -> SyncTier.ESCALATED  // escalate
+        else                                    -> SyncTier.URGENT     // urgent
+    }
+
+    private fun schedulePeriodicWork(intervalMinutes: Long, relaxBattery: Boolean) {
+        val request = PeriodicWorkRequestBuilder<AdaptiveSyncWorker>(intervalMinutes, TimeUnit.MINUTES)
+            .addTag(WORK_TAG_PERIODIC)
+            .setConstraints(buildConstraints(relaxBattery))
+            .build()
+        workManager.enqueueUniquePeriodicWork(
+            WORK_TAG_PERIODIC,
+            ExistingPeriodicWorkPolicy.KEEP,   // don't reset the clock if already ticking
+            request
+        )
+    }
+
+    private fun scheduleOneTimeWork(delayMinutes: Long, relaxBattery: Boolean) {
+        val request = OneTimeWorkRequestBuilder<AdaptiveSyncWorker>()
+            .addTag(WORK_TAG_PERIODIC)
+            .setInitialDelay(delayMinutes, TimeUnit.MINUTES)
+            .setConstraints(buildConstraints(relaxBattery))
+            .build()
+        workManager.enqueueUniqueWork(
+            WORK_TAG_PERIODIC,
+            ExistingWorkPolicy.REPLACE,        // reset delay on each reschedule
+            request
+        )
+    }
+
+    private fun buildConstraints(relaxBattery: Boolean) = Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .apply { if (!relaxBattery) setRequiresBatteryNotLow(true) }
+        .build()
+}
+
+enum class SyncTier { NONE, BACKSTOP, ESCALATED, URGENT }
+```
+
+**Required DAO addition — `oldestPendingAgeMs`:**
+
+```kotlin
+@Query("""
+    SELECT :nowMs - MIN(created_at)
+    FROM action_journal
+    WHERE sync_status = 'PENDING'
+""")
+suspend fun oldestPendingAgeMs(nowMs: Long): Long?
+// Returns null if no PENDING entries exist
+```
+```
+
+---
+
+### 19.5 WorkManager Rescheduling Strategy
+
+**Why the HIGH/CRITICAL tiers use `OneTimeWorkRequest` instead of `PeriodicWorkRequest`:**
+
+```
+WorkManager minimum PeriodicWorkRequest interval = 15 minutes (Android OS limit).
+We cannot schedule a periodic every 1 or 3 minutes via PeriodicWorkRequest.
+
+Solution: Self-rescheduling OneTimeWorkRequest chain.
+
+  SyncWorker runs
+       │
+       ▼
+  Sync completes (success or failure)
+       │
+       ▼
+  AdaptiveSyncScheduler.reschedule() called from within doWork()
+       │
+  Re-evaluates pending count
+       │
+  ┌────┴─────────────────────────────────────────┐
+  │                                              │
+  Count dropped to 0?              Count still HIGH/CRITICAL?
+  → Cancel periodic                → Schedule next OneTimeWorkRequest
+  → Done                             with same delay (1 or 3 min)
+```
+
+```kotlin
+// AdaptiveSyncWorker — wraps SyncWorker, adds self-reschedule
+class AdaptiveSyncWorker @HiltWorker constructor(
+    context: Context,
+    params: WorkerParameters,
+    private val syncManager: SyncManager,
+    private val scheduler: AdaptiveSyncScheduler
+) : CoroutineWorker(context, params) {
+
+    override suspend fun doWork(): Result {
+        return try {
+            setForeground(getForegroundInfo())
+            syncManager.sync()
+            // After sync: re-evaluate and reschedule
+            scheduler.reschedule()
+            Result.success()
+        } catch (e: Exception) {
+            scheduler.reschedule()   // reschedule even on failure
+            if (runAttemptCount < 3) Result.retry()
+            else Result.failure()
+        }
+    }
+}
+```
+
+**Why `ExistingWorkPolicy.REPLACE` for HIGH/CRITICAL:**
+
+If T1/T2/T3 already triggered a sync while the periodic is pending, the periodic
+timer should reset — no point firing it 30 seconds after a successful T2 sync.
+`REPLACE` cancels the pending delay and starts a fresh countdown from now.
+
+```
+T=0:00  Rider marks DELIVERED (action 22 pending) → HIGH tier
+        → OneTimeWorkRequest scheduled, delay = 3 min, fires at T=0:03
+
+T=0:01  Network reconnects → T2 trigger → SyncWorker fires immediately
+        → Sync completes → pending count = 0
+        → AdaptiveSyncScheduler.reschedule() → NONE tier → cancel periodic ✅
+
+Without REPLACE: the T=0:03 periodic would still fire and do nothing.
+With REPLACE:    it gets cancelled before it runs.
+```
+
+---
+
+### 19.6 Constraint Layering
+
+**`setRequiresBatteryNotLow(true)` — when to relax it:**
+
+The `BATTERY_NOT_LOW` constraint is correct for LOW and MEDIUM tiers — idle syncing
+should yield to the battery. But for HIGH and CRITICAL tiers, the rider has a large
+backlog and data loss risk is real. The constraint should be relaxed.
+
+```kotlin
+private fun buildConstraints(tier: SyncTier) = Constraints.Builder()
+    .setRequiredNetworkType(NetworkType.CONNECTED)
+    .apply {
+        when (tier) {
+            SyncTier.LOW,
+            SyncTier.MEDIUM   -> setRequiresBatteryNotLow(true)   // yield to battery
+
+            SyncTier.HIGH,
+            SyncTier.CRITICAL -> { /* no battery constraint — sync is urgent */ }
+
+            SyncTier.NONE     -> { /* irrelevant — not scheduled */ }
+        }
+    }
+    .build()
+```
+
+**Wi-Fi vs mobile data awareness:**
+
+On metered connections (mobile data), HIGH/CRITICAL tiers still sync — data loss
+is more costly than a few KB of data usage. But the batch size can be reduced:
+
+```kotlin
+val batchSize = if (isOnWifi()) 50 else 20
+// Smaller batches on mobile data: more API calls but each is smaller
+// Rider on metered data pays per KB, not per call
+```
+
+**`isOnWifi()` check:**
+
+```kotlin
+fun isOnWifi(): Boolean {
+    val mgr = context.getSystemService(ConnectivityManager::class.java)
+    val caps = mgr.getNetworkCapabilities(mgr.activeNetwork) ?: return false
+    return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+}
+```
+
+---
+
+### 19.7 Interaction with Other Sync Triggers
+
+The adaptive periodic (T4) does not replace T1, T2, T3 — it is the **fallback** for
+when those event-based triggers are missed. Here is how all four interact:
+
+```
+T1 (app foreground):
+  Always fires. Not throttled. No dependency on pending count.
+  Resets the T4 periodic timer via REPLACE policy.
+
+T2 (network available):
+  Always fires. Throttled by 30s cooldown (Section 18.13).
+  Resets the T4 periodic timer via REPLACE policy.
+
+T3 (after rider action):
+  Always fires. Triggers AdaptiveSyncScheduler.reschedule() to re-evaluate tier.
+  May upgrade or downgrade the T4 interval.
+  Example: action #5 is recorded → count crosses LOW→MEDIUM → interval drops 30→10 min.
+
+T4 (adaptive periodic):
+  Fires ONLY if T1/T2/T3 didn't already handle the pending actions.
+  Self-cancels when pending count reaches 0.
+  Self-upgrades/downgrades interval as count changes.
+
+Interaction example:
+  T=0:00  Rider records action 5 → T3 fires → sync succeeds → count = 0 → T4 cancelled
+  T=0:30  Rider goes offline, records 8 more actions → T3 fires → no network → sync fails
+           Count = 8 → MEDIUM tier → T4 scheduled every 10 min
+  T=0:40  T4 fires → still offline → reschedule T4 for T=0:50
+  T=0:45  Network returns → T2 fires → sync succeeds → count = 0 → T4 cancelled ✅
+  T=0:50  T4 would have fired — cancelled, does not run ✅
+```
+
+---
+
+### 19.8 Fleet-Level Impact
+
+Comparing fixed 15-min periodic vs adaptive across 10,000 riders over a full day:
+
+```
+Metric                    Fixed 15-min      Adaptive          Saving
+──────────────────────────────────────────────────────────────────────
+WorkManager wake-ups/day  960,000           ~120,000          87% ↓
+Useful wake-ups/day       ~240,000          ~118,000          (same useful work)
+Empty wake-ups/day        ~720,000          ~2,000            99.7% ↓
+Estimated battery wasted  1,440 mAh/day     ~4 mAh/day        ~1,436 mAh ↓
+Mobile data overhead      ~480 MB/day       ~60 MB/day        87% ↓
+Backend health check load ~720,000 hits/day ~2,000 hits/day   99.7% ↓
+──────────────────────────────────────────────────────────────────────
+Notes:
+  - "Useful" = sync triggered with ≥1 PENDING action
+  - Battery estimate: 0.002 mAh per empty wake × count
+  - Data: 0.5 KB overhead per wake-up × count
+  - Adaptive empty wakes ≈ 2,000 (only T4 NONE→LOW boundary edge cases)
+```
+
+**The adaptive approach does the same useful work as the fixed periodic but
+eliminates nearly all wasteful work.** T1, T2, and T3 handle the vast majority
+of real sync events. T4 adaptive is the narrow safety net it was always meant to be —
+now correctly sized to the actual risk level at any given moment.
+
+---
+
+### 19.9 Trade-offs of Adaptive Sync
+
+| Aspect | Fixed 15-min | Adaptive | Notes |
+|---|---|---|---|
+### 19.9 Trade-offs of Adaptive Sync
+
+| Aspect | Fixed 15-min | Adaptive | Notes |
+|---|---|---|---|
+| Battery cost (idle rider) | High — wakes every 15 min | None — no periodic when 0 pending | Major win for off-shift riders |
+| Battery cost (active rider) | Same as adaptive at HIGH | Same as fixed at MEDIUM | No difference in peak load |
+| Data cost (metered) | ~48 KB/day/rider overhead | ~6 KB/day/rider overhead | Important in cost-sensitive markets |
+| Backend load | 40,000 wake-ups/hr constant | Proportional to actual work | Smoother server load curve |
+| Implementation complexity | Simple — one PeriodicWorkRequest | Moderate — tier logic + self-reschedule | Worth the complexity at 10k riders |
+| Safety net coverage | Fires regardless | Only fires when there is work | Event triggers (T1/T2/T3) must be reliable |
+| WorkManager OS minimum | Not a concern | 15-min floor for PERIODIC mode | HIGH/CRITICAL use OneTimeWorkRequest chain |
+| Debuggability | Simple to reason about | Need to log tier transitions | Add tier to sync breadcrumbs in Crashlytics |
 
 ---
 
 ## 18. Conflict Resolution — Complete Coverage
-
-### 18.1 Audit Summary
 
 Every conflict scenario has been audited against the existing design. The table below
 shows what was already covered, what needed extending, and what was missing entirely.
@@ -2684,4 +3507,1377 @@ Network flapping            | 30s cooldown + debounce    | Idempotency (safety n
 Payload too large           | Adaptive binary split      | 413 + X-Max-Batch-Size      | Nothing (auto-split)
 DB corruption               | WAL + integrity_check      | Emergency journal upload    | "Technical issue" + restart
 Replay attack               | Timestamp + HMAC           | Signature verification      | Nothing (blocked silently)
+```
+---
+
+## 20. QR Scan Validation
+
+### 20.1 All Wrong-QR Scenarios
+
+A rider can scan the wrong QR in many different ways. Each requires a different
+response — some are silent rejections, some need clear UI feedback, and some are
+security signals worth logging.
+
+```
+Wrong QR scenarios:
+────────────────────────────────────────────────────────────────────
+  S1  Completely foreign QR     (restaurant menu, UPI link, URL, Wi-Fi)
+  S2  Competitor logistics QR   (valid shipment format, different company)
+  S3  Wrong rider's shipment    (our company, valid ID, assigned to R2 not R1)
+  S4  Terminal state shipment   (already DELIVERED / CANCELLED / FAILED)
+  S5  Wrong zone / hub          (valid shipment, but outside rider's service area)
+  S6  Damaged / partial scan    (decodes to garbled string, checksum fails)
+  S7  Wrong action context      (delivery QR scanned at pickup stage, or vice versa)
+  S8  Duplicate scan            (same QR scanned twice in the same session)
+────────────────────────────────────────────────────────────────────
+```
+
+Validation must catch these at **two layers**:
+
+- **Layer 1 — Client-side (instant, no network needed):** Structural checks.
+  Catches S1, S2, S6, S8 immediately, before any network call.
+- **Layer 2 — Server-side (requires connectivity):** Semantic checks.
+  Catches S3, S4, S5, S7 definitively.
+
+---
+
+### 20.2 Validation Architecture — Two Layers
+
+```
+Camera decodes raw QR string
+            │
+            ▼
+┌───────────────────────────────────────────────────────────┐
+│           LAYER 1: CLIENT-SIDE STRUCTURAL VALIDATION      │
+│           (instant, zero network, happens always)         │
+│                                                           │
+│  1. Is it non-empty and within length bounds?             │
+│  2. Does it match our QR format/prefix? (e.g. "SHP-...")  │
+│  3. Does checksum digit pass?                             │
+│  4. Has this QR already been scanned this session?        │
+│                                                           │
+│  FAIL → reject immediately with specific error code       │
+│  PASS → continue to Layer 2                               │
+└──────────────────────────────┬────────────────────────────┘
+                               │
+                               ▼
+┌───────────────────────────────────────────────────────────┐
+│           LOCAL DB FAST PATH                              │
+│           (before any network call)                       │
+│                                                           │
+│  Is shipment_id already in local Room DB?                 │
+│    → YES, state = active    → proceed directly (no server │
+│                               call needed)                │
+│    → YES, state = terminal  → S4 rejection (immediate)   │
+│    → NO                     → go to Layer 2              │
+└──────────────────────────────┬────────────────────────────┘
+                               │
+                               ▼
+┌───────────────────────────────────────────────────────────┐
+│           LAYER 2: SERVER-SIDE SEMANTIC VALIDATION        │
+│           (requires connectivity; skipped if offline)     │
+│                                                           │
+│  POST /v1/qr/validate                                     │
+│  { shipment_id, rider_id, action_context, scan_token }    │
+│                                                           │
+│  Server checks:                                           │
+│  - Does shipment exist?          → S1/S2 if not           │
+│  - Is it assigned to this rider? → S3 if not              │
+│  - Is it in a terminal state?    → S4 if yes              │
+│  - Is it in rider's zone?        → S5 if not              │
+│  - Is action_context valid?      → S7 if wrong            │
+│                                                           │
+│  PASS → proceed to CreatePickupTaskUseCase / action flow  │
+└───────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 20.3 Layer 1: Client-Side Structural Validation
+
+```kotlin
+object QrStructuralValidator {
+
+    // Our shipment QR format: "SHP-{10 alphanumeric}-{1 checksum digit}"
+    // Example: "SHP-A1B2C3D4E5-7"
+    private val QR_REGEX = Regex("^SHP-[A-Z0-9]{10}-[0-9]\$")
+
+    fun validate(rawQr: String, sessionScannedIds: Set<String>): QrStructuralResult {
+
+        // Check 1: Empty or oversized
+        if (rawQr.isBlank() || rawQr.length > 64) {
+            return QrStructuralResult.Reject(QrRejectionReason.FOREIGN_QR)
+        }
+
+        // Check 2: Format / prefix match
+        if (!QR_REGEX.matches(rawQr)) {
+            // Does it look like a URL, UPI, Wi-Fi etc.?
+            val reason = when {
+                rawQr.startsWith("http")  -> QrRejectionReason.FOREIGN_QR_URL
+                rawQr.startsWith("upi://")-> QrRejectionReason.FOREIGN_QR_PAYMENT
+                rawQr.startsWith("WIFI:") -> QrRejectionReason.FOREIGN_QR_WIFI
+                else                      -> QrRejectionReason.FOREIGN_QR
+            }
+            return QrStructuralResult.Reject(reason)
+        }
+
+        // Check 3: Luhn / checksum digit validation
+        val shipmentCore = rawQr.substringAfter("SHP-").substringBeforeLast("-")
+        val checkDigit   = rawQr.last().digitToInt()
+        if (!validateChecksum(shipmentCore, checkDigit)) {
+            return QrStructuralResult.Reject(QrRejectionReason.DAMAGED_QR)
+        }
+
+        // Check 4: Duplicate scan in current session
+        val shipmentId = rawQr  // or extract the canonical ID from the QR
+        if (shipmentId in sessionScannedIds) {
+            return QrStructuralResult.Reject(QrRejectionReason.DUPLICATE_SCAN)
+        }
+
+        return QrStructuralResult.Pass(shipmentId = shipmentId)
+    }
+
+    // Luhn-style checksum: sum of digit values mod 10 == checkDigit
+    private fun validateChecksum(core: String, expected: Int): Boolean {
+        val sum = core.sumOf {
+            if (it.isDigit()) it.digitToInt()
+            else (it.code - 'A'.code + 1) % 10   // map letters to 1–9
+        }
+        return (sum % 10) == expected
+    }
+}
+
+sealed class QrStructuralResult {
+    data class Pass(val shipmentId: String) : QrStructuralResult()
+    data class Reject(val reason: QrRejectionReason) : QrStructuralResult()
+}
+```
+
+---
+
+### 20.4 Layer 2: Server-Side Semantic Validation
+
+New dedicated endpoint — lighter than the full `validateAndClaimShipment` used in
+pickup creation. This is a **read-only validation** that does not claim or mutate anything.
+
+```
+POST /v1/qr/validate
+{
+  "shipment_id":    "SHP-A1B2C3D4E5-7",
+  "rider_id":       "R456",
+  "action_context": "PICKUP",           ← what the rider is trying to do
+  "scan_token":     "uuid-v4"           ← idempotency: prevents log flooding on retry
+}
+
+Response:
+{
+  "result": "VALID" | "INVALID",
+  "rejection_reason": null | "WRONG_RIDER" | "TERMINAL_STATE" |
+                               "WRONG_ZONE"  | "WRONG_CONTEXT"  |
+                               "NOT_FOUND",
+  "detail": {
+    "current_state":      "DELIVERED",        ← for TERMINAL_STATE
+    "assigned_to_zone":   "North Mumbai",     ← for WRONG_ZONE
+    "rider_current_zone": "South Mumbai",
+    "expected_context":   "DELIVERY"          ← for WRONG_CONTEXT
+  }
+}
+```
+
+**`action_context` values:**
+
+```
+PICKUP          → rider is scanning to self-create a pickup task
+OUT_FOR_DELIVERY → rider is scanning to confirm they have the parcel before leaving hub
+DELIVERY        → rider is scanning at customer doorstep to mark delivery
+```
+
+---
+
+### 20.5 QrValidationUseCase — Full Decision Tree
+
+```kotlin
+class QrValidationUseCase @Inject constructor(
+    private val structuralValidator: QrStructuralValidator,
+    private val shipmentDao: ShipmentDao,
+    private val apiService: DeliveryApiService,
+    private val connectivity: ConnectivityObserver,
+    private val scanAuditLog: ScanAuditLog,
+    private val sessionScans: ScanSessionTracker   // in-memory, cleared on app restart
+) {
+    suspend fun validate(
+        rawQr: String,
+        actionContext: ActionContext
+    ): QrValidationResult {
+
+        // ── LAYER 1: Structural ────────────────────────────────────────
+        val structural = structuralValidator.validate(rawQr, sessionScans.scannedIds)
+        if (structural is QrStructuralResult.Reject) {
+            scanAuditLog.record(rawQr, structural.reason, actionContext)
+            return QrValidationResult.Rejected(structural.reason)
+        }
+        val shipmentId = (structural as QrStructuralResult.Pass).shipmentId
+
+        // ── LOCAL DB FAST PATH ─────────────────────────────────────────
+        val localShipment = shipmentDao.getById(shipmentId)
+        if (localShipment != null) {
+            when {
+                localShipment.isTerminal() -> {
+                    scanAuditLog.record(shipmentId, QrRejectionReason.TERMINAL_STATE, actionContext)
+                    return QrValidationResult.Rejected(
+                        reason  = QrRejectionReason.TERMINAL_STATE,
+                        detail  = "Shipment is already ${localShipment.currentState}"
+                    )
+                }
+                localShipment.isActive() -> {
+                    // Already in our DB and active — valid, skip server call
+                    sessionScans.record(shipmentId)
+                    return QrValidationResult.Valid(shipmentId, source = ValidationSource.LOCAL_DB)
+                }
+            }
+        }
+
+        // ── LAYER 2: Server-side (if online) ──────────────────────────
+        if (!connectivity.isOnline.value) {
+            // Offline: cannot do semantic validation
+            // Return UNVERIFIED — caller decides whether to accept or defer
+            return QrValidationResult.UnverifiedOffline(shipmentId)
+        }
+
+        val serverResult = try {
+            apiService.validateQr(
+                QrValidateRequest(
+                    shipmentId    = shipmentId,
+                    riderId       = getCurrentRiderId(),
+                    actionContext = actionContext.name,
+                    scanToken     = UUID.randomUUID().toString()
+                )
+            )
+        } catch (e: IOException) {
+            return QrValidationResult.UnverifiedOffline(shipmentId)
+        }
+
+        return when (serverResult.result) {
+            "VALID" -> {
+                sessionScans.record(shipmentId)
+                scanAuditLog.record(shipmentId, null, actionContext)
+                QrValidationResult.Valid(shipmentId, source = ValidationSource.SERVER)
+            }
+            "INVALID" -> {
+                val reason = QrRejectionReason.fromServerCode(serverResult.rejectionReason)
+                scanAuditLog.record(shipmentId, reason, actionContext)
+                QrValidationResult.Rejected(reason, detail = serverResult.detail)
+            }
+            else -> QrValidationResult.UnverifiedOffline(shipmentId)
+        }
+    }
+}
+
+sealed class QrValidationResult {
+    data class Valid(
+        val shipmentId: String,
+        val source: ValidationSource           // LOCAL_DB | SERVER
+    ) : QrValidationResult()
+
+    data class Rejected(
+        val reason: QrRejectionReason,
+        val detail: Any? = null
+    ) : QrValidationResult()
+
+    data class UnverifiedOffline(
+        val shipmentId: String                 // pass to CreatePickupTaskUseCase as UNVERIFIED_PICKUP
+    ) : QrValidationResult()
+}
+
+enum class ValidationSource { LOCAL_DB, SERVER }
+```
+
+---
+
+### 20.6 Wrong QR Scenario Handling (All 8 Cases)
+
+#### S1 — Completely Foreign QR (restaurant menu, URL, UPI, Wi-Fi)
+
+```
+Caught by: Layer 1 — format regex fails immediately
+Response:  QrRejectionReason.FOREIGN_QR (sub-typed: FOREIGN_QR_URL, FOREIGN_QR_PAYMENT etc.)
+
+UI:
+┌────────────────────────────────────────────────────────┐
+│  ❌  Wrong QR code scanned                             │
+│  This doesn't look like a shipment label.              │
+│  Please scan the barcode on the parcel.                │
+│                          [Try Again]  [Enter Manually] │
+└────────────────────────────────────────────────────────┘
+
+Camera auto-resumes after 1.5 seconds — no manual dismiss needed.
+No network call. No audit log entry (too noisy — these are accidental).
+```
+
+#### S2 — Competitor Logistics QR (valid barcode format, different prefix)
+
+```
+Caught by: Layer 1 — format prefix check ("SHP-" not matched)
+Response:  QrRejectionReason.FOREIGN_QR
+
+Example: Rider scans a DTDC/BlueDart label which has its own barcode format.
+
+UI:
+┌────────────────────────────────────────────────────────┐
+│  ❌  This parcel belongs to a different courier         │
+│  Please scan your company's shipment label only.       │
+│                          [Try Again]  [Enter Manually] │
+└────────────────────────────────────────────────────────┘
+
+Note: Competitor prefix detection requires a known-prefix list maintained
+server-side and synced to the app (via remote config, refreshed daily).
+Unrecognised formats fall back to FOREIGN_QR generic message.
+```
+
+#### S3 — Valid Shipment, Assigned to Another Rider
+
+```
+Caught by: Layer 2 — server checks rider assignment
+Response:  QrRejectionReason.WRONG_RIDER
+
+UI:
+┌────────────────────────────────────────────────────────┐
+│  ❌  This parcel is not assigned to you                 │
+│  Shipment SHP-A1B2C3D4E5 belongs to a different rider. │
+│  If you believe this is an error:                      │
+│                   [Contact Support]   [Scan Another]   │
+└────────────────────────────────────────────────────────┘
+
+Security: WRONG_RIDER is logged in scan audit log with rider_id, shipment_id,
+and timestamp. Multiple WRONG_RIDER scans from one rider → alert ops.
+(Could indicate deliberate attempt to intercept another rider's parcel.)
+```
+
+#### S4 — Terminal State Shipment (Already Delivered / Cancelled / Failed)
+
+```
+Caught by: Local DB fast path (instant, no network) OR Layer 2
+Response:  QrRejectionReason.TERMINAL_STATE
+
+UI:
+┌────────────────────────────────────────────────────────┐
+│  ⚠️  This shipment is already closed                   │
+│  SHP-A1B2C3D4E5 was marked DELIVERED on 28 Feb, 2:34PM │
+│  No further actions are allowed.                       │
+│                   [View History]   [Scan Another]      │
+└────────────────────────────────────────────────────────┘
+
+Shows the terminal state and timestamp so the rider understands what happened.
+If the rider believes the closure is wrong → [View History] shows full audit trail.
+```
+
+#### S5 — Wrong Zone / Hub
+
+```
+Caught by: Layer 2 — server checks geographic assignment
+Response:  QrRejectionReason.WRONG_ZONE
+
+UI:
+┌────────────────────────────────────────────────────────┐
+│  ❌  This parcel is for a different delivery zone       │
+│  SHP-A1B2C3D4E5 is assigned to: North Mumbai           │
+│  Your current zone: South Mumbai                       │
+│                   [Contact Support]   [Scan Another]   │
+└────────────────────────────────────────────────────────┘
+
+Common cause: hub sorting error — parcel ended up in wrong batch.
+Rider should hand it back to hub supervisor, not attempt delivery.
+```
+
+#### S6 — Damaged / Partial QR (Checksum Fails)
+
+```
+Caught by: Layer 1 — checksum validation fails
+Response:  QrRejectionReason.DAMAGED_QR
+
+UI:
+┌────────────────────────────────────────────────────────┐
+│  ⚠️  Could not read this barcode clearly               │
+│  The label may be damaged or obscured.                 │
+│  Try:                                                  │
+│    • Better lighting                                   │
+│    • Clean the camera lens                             │
+│    • Hold steady, 15-20cm from label                  │
+│                   [Try Again]  [Enter ID Manually]     │
+└────────────────────────────────────────────────────────┘
+
+Actionable tips shown. Manual entry is the fallback.
+Partial scan attempts (where the decoded string partially matches our format
+but checksum fails) are logged — repeated checksum failures on same barcode
+prefix signal a physically damaged label → ops team can re-label.
+```
+
+#### S7 — Wrong Action Context
+
+```
+Caught by: Layer 2 — action_context mismatch
+Response:  QrRejectionReason.WRONG_CONTEXT
+
+Example A: Rider is at hub scanning for PICKUP but scans a
+           DELIVERY-only shipment (e.g., a C2C return already processed).
+
+Example B: Rider is doing DELIVERY scan at doorstep but the shipment
+           is still in ASSIGNED state (never picked up).
+
+UI for Example B:
+┌────────────────────────────────────────────────────────┐
+│  ⚠️  This parcel hasn't been picked up yet             │
+│  SHP-A1B2C3D4E5 must be picked up before delivery.    │
+│  Expected action: PICKUP                               │
+│                             [Go to Pickup]   [Cancel]  │
+└────────────────────────────────────────────────────────┘
+
+Deep link: [Go to Pickup] opens the task detail screen for this shipment
+pre-loaded with the correct action. Rider doesn't re-scan — they just confirm.
+```
+
+#### S8 — Duplicate Scan (Same QR in Same Session)
+
+```
+Caught by: Layer 1 — sessionScannedIds check
+Response:  QrRejectionReason.DUPLICATE_SCAN
+
+This is purely client-side. If the rider already scanned SHP-A1B2C3D4E5
+earlier in the same app session, we don't re-validate or re-show the task.
+
+UI:
+┌────────────────────────────────────────────────────────┐
+│  ℹ️  You already scanned this parcel                   │
+│  SHP-A1B2C3D4E5 is in your active task list.           │
+│                        [View Task]      [Scan Another] │
+└────────────────────────────────────────────────────────┘
+
+[View Task] deep links directly to the task detail screen.
+sessionScannedIds is in-memory and clears on app restart —
+intentional, because a new session means a legitimate re-scan is possible.
+```
+
+---
+
+### 20.7 Offline Validation Behaviour
+
+When the rider is offline, Layer 2 cannot run. The decision per scenario:
+
+```
+Scenario          Offline handling
+──────────────────────────────────────────────────────────────────────
+S1 Foreign QR     Caught by Layer 1 — works offline ✅
+S2 Competitor QR  Caught by Layer 1 (prefix list from last remote config sync)
+                  If prefix list stale → falls through as UNVERIFIED_PICKUP ⚠️
+S3 Wrong rider    Cannot verify offline → UNVERIFIED_PICKUP
+                  Server resolves on sync → CONFLICT
+S4 Terminal state Caught by local DB fast path if shipment is in DB ✅
+                  If not in DB → UNVERIFIED_PICKUP (low risk — terminal
+                  shipments are rarely not in local DB)
+S5 Wrong zone     Cannot verify offline → UNVERIFIED_PICKUP
+                  Likely resolved by hub ops anyway
+S6 Damaged QR     Caught by Layer 1 checksum — works offline ✅
+S7 Wrong context  Cannot verify offline → UNVERIFIED_PICKUP
+                  Sync resolves if context is wrong
+S8 Duplicate      Caught by Layer 1 in-memory set — works offline ✅
+```
+
+**The offline rule:** If Layer 1 passes and local DB has no answer, always create
+as `UNVERIFIED_PICKUP` and let sync resolve it. Never block the rider completely
+offline — a false rejection hurts operations more than a false acceptance that
+gets caught on sync.
+
+---
+
+### 20.8 Scan Audit Log
+
+Every scan attempt — success or failure — is written to a local `scan_audit_log`
+table and synced to the backend. This is separate from `action_journal`.
+
+```sql
+CREATE TABLE scan_audit_log (
+    scan_id        TEXT PRIMARY KEY,
+    shipment_id    TEXT,              -- may be null for fully foreign QR
+    raw_qr_hash    TEXT NOT NULL,     -- SHA-256 of raw QR string (never store raw)
+    rider_id       TEXT NOT NULL,
+    action_context TEXT NOT NULL,
+    result         TEXT NOT NULL,     -- VALID | REJECTED | UNVERIFIED_OFFLINE
+    rejection_reason TEXT,
+    scanned_at     INTEGER NOT NULL,  -- NTP time
+    synced         INTEGER DEFAULT 0
+);
+```
+
+**Why hash the raw QR and not store it?** The raw QR may contain PII (recipient
+name embedded in some formats). Storing SHA-256 gives us a unique fingerprint for
+deduplication and fraud detection without storing PII locally.
+
+**What the audit log enables:**
+
+```
+Ops / Security use cases:
+  → Rider scanning many WRONG_RIDER codes → possible interception attempt
+  → Rider scanning many FOREIGN_QR codes  → camera or environment issue
+  → Same QR scanned by 3 different riders → hub sorting error pattern
+  → WRONG_ZONE scans clustered at specific hub → systematic mis-sort
+```
+
+---
+
+### 20.9 UI Feedback per Rejection Reason
+
+The camera overlay should provide feedback **without dismissing the scanner** for
+recoverable errors. Only unrecoverable errors (WRONG_RIDER, WRONG_ZONE, TERMINAL)
+require explicit acknowledgement.
+
+```
+Rejection Type     Camera behaviour    Feedback style         Auto-resume?
+────────────────────────────────────────────────────────────────────────────
+FOREIGN_QR         Stay open           Red flash + toast       Yes, 1.5s
+COMPETITOR_QR      Stay open           Red flash + toast       Yes, 1.5s
+DAMAGED_QR         Stay open           Yellow flash + tips     Yes, 3s
+DUPLICATE_SCAN     Stay open           Blue flash + "View"     Yes, 2s
+WRONG_RIDER        Pause               Modal with support CTA  No (explicit)
+TERMINAL_STATE     Pause               Modal with history CTA  No (explicit)
+WRONG_ZONE         Pause               Modal with zone detail  No (explicit)
+WRONG_CONTEXT      Pause               Modal with deep link    No (explicit)
+UNVERIFIED_OFFLINE Stay open           Yellow banner           Yes, 2s
+VALID              Close scanner       Success animation       N/A
+────────────────────────────────────────────────────────────────────────────
+```
+
+**Haptic feedback:**
+- Valid scan → single strong pulse (success)
+- Soft error (FOREIGN_QR, DAMAGED) → double short pulse
+- Hard error (WRONG_RIDER, TERMINAL) → long buzz
+
+**Sound feedback (respects silent mode):**
+- Valid → success chime
+- Error → low error tone
+
+---
+
+### 20.10 Wrong QR Validation Decision Matrix
+
+```
+Scenario            Layer Catches  Online Needed  Creates UNVERIFIED?  UI Type
+──────────────────────────────────────────────────────────────────────────────
+S1 Foreign QR       Layer 1        No             No                   Toast
+S2 Competitor QR    Layer 1        No (cached)    No (usually)         Toast
+S3 Wrong rider      Layer 2        Yes            Yes (if offline)     Modal
+S4 Terminal state   Local DB / L2  No             No                   Modal
+S5 Wrong zone       Layer 2        Yes            Yes (if offline)     Modal
+S6 Damaged QR       Layer 1        No             No                   Toast+tips
+S7 Wrong context    Layer 2        Yes            Yes (if offline)     Modal+deeplink
+S8 Duplicate scan   Layer 1        No             No                   Toast+deeplink
+──────────────────────────────────────────────────────────────────────────────
+```
+
+
+---
+
+## 21. Sync Event Logging & Observability
+
+### 21.1 The Problem — Silent Failures
+
+The action journal tells us *what happened on the device*. But when sync breaks,
+that information is trapped on the device. The backend sees silence — no incoming
+actions from a rider — and cannot distinguish between:
+
+```
+A. Rider is offline in a dead zone (expected, fine)
+B. Sync is broken silently — network present but sync failing (critical)
+C. WorkManager killed by OEM — app alive but background work stopped (critical)
+D. Rider hasn't opened the app (operational gap)
+E. Action journal permanently FAILED after retries (data loss risk)
+```
+
+Without telemetry, all five look identical from the backend. The fix is a
+dedicated **sync event log** — a lightweight stream of structured events from
+the device that tells the backend exactly what the sync engine is doing and
+where it is failing, independently of whether sync itself succeeds.
+
+**Critical design constraint:** The event log must work even when sync is broken.
+It uses a separate lightweight endpoint and a separate local buffer — if the
+main sync is failing for reason X, the event log still gets through to tell
+the backend about reason X.
+
+---
+
+### 21.2 What Constitutes a Sync Event
+
+Not every sync cycle is an event. Only meaningful state changes and failures:
+
+```
+Category         Event                              Severity
+────────────────────────────────────────────────────────────────────────
+SYNC_SUCCESS     Batch fully synced                 INFO
+SYNC_PARTIAL     Some records in batch failed       WARN
+SYNC_FAILED      Entire batch failed (network/5xx)  ERROR
+RETRY_EXHAUSTED  Action hit max retries → FAILED    CRITICAL
+CONFLICT         INVALID_TRANSITION from server     WARN
+CLOCK_SKEW       Server rejected timestamp          WARN
+VERSION_CONFLICT Optimistic lock mismatch           WARN
+STUCK_INPROGRESS Startup found IN_PROGRESS entries  WARN
+OFFLINE_BUILDUP  PENDING count > threshold offline  WARN
+DB_WRITE_FAILURE Room write threw exception         CRITICAL
+WORKER_EXHAUSTED WorkManager retries exhausted      ERROR
+PAYLOAD_TOO_LARGE 413 received from server          WARN
+SIGNATURE_INVALID HMAC rejected by server           CRITICAL
+REASSIGNED       Shipment reassigned mid-sync       WARN
+DELETED          Shipment deleted on server         INFO
+────────────────────────────────────────────────────────────────────────
+```
+
+---
+
+### 21.3 SyncEvent Schema (Local + Remote)
+
+**Local Room table** — buffer before upload:
+
+```sql
+CREATE TABLE sync_event_log (
+    event_id          TEXT PRIMARY KEY,   -- UUID v4
+    rider_id          TEXT NOT NULL,
+    event_type        TEXT NOT NULL,      -- enum values from 21.2
+    severity          TEXT NOT NULL,      -- INFO | WARN | ERROR | CRITICAL
+    shipment_id       TEXT,               -- nullable: not all events are shipment-specific
+    action_id         TEXT,               -- nullable: journal entry that failed
+    pending_count     INTEGER,            -- snapshot of PENDING count at event time
+    retry_count       INTEGER,            -- for RETRY_EXHAUSTED events
+    error_code        TEXT,               -- HTTP status, exception class, server code
+    error_message     TEXT,               -- truncated to 512 chars
+    device_info       TEXT NOT NULL,      -- JSON: {os_version, app_version, manufacturer}
+    network_type      TEXT,               -- WIFI | MOBILE | NONE
+    battery_level     INTEGER,            -- 0–100
+    free_storage_mb   INTEGER,
+    occurred_at       INTEGER NOT NULL,   -- NTP epoch ms
+    uploaded          INTEGER DEFAULT 0   -- 0 = pending upload, 1 = uploaded
+);
+
+CREATE INDEX idx_sync_event_uploaded ON sync_event_log(uploaded, occurred_at);
+CREATE INDEX idx_sync_event_severity ON sync_event_log(severity, uploaded);
+```
+
+**Why store device_info, network_type, battery_level?** These are the first
+questions ops asks when debugging sync failures. "What network was the rider on?"
+"Was the battery low — did WorkManager skip?" Capturing them at event time
+costs ~100 bytes and eliminates a whole investigation step.
+
+---
+
+### 21.4 All Loggable Sync Failure Points
+
+Every place in the codebase that can fail silently, mapped to its event type:
+
+```
+Failure Point                           Event Type         Where It Fires
+──────────────────────────────────────────────────────────────────────────────
+Action write fails (Room exception)     DB_WRITE_FAILURE   PerformTaskActionUseCase
+Startup finds IN_PROGRESS entries       STUCK_INPROGRESS   StartupRecoveryUseCase
+Batch network error (IOException/5xx)   SYNC_FAILED        SyncManager.syncBatch()
+Per-record INVALID_TRANSITION           CONFLICT           SyncManager.syncBatch()
+Per-record retry_count hits max         RETRY_EXHAUSTED    SyncManager.syncBatch()
+Clock skew rejected (CLOCK_SKEW_REJECTED) CLOCK_SKEW       SyncManager.syncBatch()
+Version conflict (VERSION_CONFLICT)     VERSION_CONFLICT   SyncManager.syncBatch()
+Payload 413                             PAYLOAD_TOO_LARGE  SyncManager.syncBatch()
+HMAC rejected (SIGNATURE_INVALID)       SIGNATURE_INVALID  SyncManager.syncBatch()
+Shipment reassigned (REASSIGNED)        REASSIGNED         SyncManager.syncBatch()
+Shipment deleted (SHIPMENT_NOT_FOUND)   DELETED            SyncManager.syncBatch()
+WorkManager doWork() exhausted retries  WORKER_EXHAUSTED   SyncWorker.doWork()
+PENDING count > 20 while offline        OFFLINE_BUILDUP    SyncOrchestrator
+Batch partially failed                  SYNC_PARTIAL       SyncManager.syncBatch()
+Batch fully succeeded                   SYNC_SUCCESS       SyncManager.sync()
+──────────────────────────────────────────────────────────────────────────────
+```
+
+---
+
+### 21.5 SyncEventLogger Implementation
+
+```kotlin
+class SyncEventLogger @Inject constructor(
+    private val syncEventDao: SyncEventDao,
+    private val connectivity: ConnectivityObserver,
+    private val ntpTime: NtpTimeProvider,
+    private val deviceInfoProvider: DeviceInfoProvider,
+    private val batteryMonitor: BatteryMonitor,
+    private val storageMonitor: StorageMonitor
+) {
+    /**
+     * Log a sync event locally. Always succeeds — never throws.
+     * Upload is handled separately by SyncEventUploader.
+     */
+    suspend fun log(
+        eventType: SyncEventType,
+        severity: SyncEventSeverity,
+        shipmentId: String?      = null,
+        actionId: String?        = null,
+        pendingCount: Int?       = null,
+        retryCount: Int?         = null,
+        errorCode: String?       = null,
+        errorMessage: String?    = null
+    ) {
+        runCatching {
+            syncEventDao.insert(
+                SyncEventEntity(
+                    eventId       = UUID.randomUUID().toString(),
+                    riderId       = getCurrentRiderId(),
+                    eventType     = eventType.name,
+                    severity      = severity.name,
+                    shipmentId    = shipmentId,
+                    actionId      = actionId,
+                    pendingCount  = pendingCount,
+                    retryCount    = retryCount,
+                    errorCode     = errorCode,
+                    errorMessage  = errorMessage?.take(512),  // cap at 512 chars
+                    deviceInfo    = deviceInfoProvider.snapshot(),
+                    networkType   = connectivity.currentNetworkType(),
+                    batteryLevel  = batteryMonitor.currentLevel(),
+                    freeStorageMb = storageMonitor.freeMb(),
+                    occurredAt    = ntpTime.currentTimeMs(),
+                    uploaded      = 0
+                )
+            )
+        }
+        // runCatching: if DB itself is broken, event logging must not crash the app
+    }
+}
+```
+
+**`DeviceInfoProvider.snapshot()` — captured as a JSON string:**
+
+```kotlin
+data class DeviceSnapshot(
+    val manufacturer: String,   // "Xiaomi", "Samsung"
+    val model: String,          // "Redmi Note 11"
+    val osVersion: Int,         // 33 (Android 13)
+    val appVersion: String,     // "4.2.1"
+    val appBuild: Int           // 412
+)
+// Serialised to: {"manufacturer":"Xiaomi","model":"Redmi Note 11","os":33,"app":"4.2.1","build":412}
+```
+
+---
+
+### 21.6 Local Buffer — Log Before You Send
+
+The event log is **always written locally first**, then uploaded separately.
+This is the key design — if the sync itself is broken, we still capture what
+happened, and upload the events when the pipe opens even briefly.
+
+```
+Sync failure occurs
+       │
+       ▼
+SyncEventLogger.log() → INSERT into sync_event_log (uploaded=0)
+       │                  ← this always works (local Room write)
+       │
+       ▼
+SyncEventUploader runs (separate from main SyncManager)
+       │
+       ├── Triggered by:
+       │     - Any network reconnection (T2)
+       │     - App foreground (T1)
+       │     - After every main sync cycle (piggyback)
+       │
+       ├── Query: SELECT * FROM sync_event_log
+       │          WHERE uploaded = 0
+       │          ORDER BY occurred_at ASC
+       │          LIMIT 200                 ← max 200 events per upload batch
+       │
+       ├── POST /v1/sync-events (see 21.7)
+       │
+       └── On success: UPDATE uploaded = 1 for sent events
+           On failure: leave as uploaded = 0, retry next cycle
+
+Cleanup: events with uploaded = 1 and occurred_at > 7 days → DELETE
+```
+
+**Why a separate uploader, not piggybacking on SyncManager?**
+
+If SyncManager is the thing that's broken, we can't rely on it to also upload
+evidence of its own failure. `SyncEventUploader` is a simpler, independent
+coroutine with no Mutex dependency and a much lighter payload.
+
+```kotlin
+class SyncEventUploader @Inject constructor(
+    private val syncEventDao: SyncEventDao,
+    private val apiService: DeliveryApiService
+) {
+    suspend fun upload() {
+        val pending = syncEventDao.getPendingUpload(limit = 200)
+        if (pending.isEmpty()) return
+
+        runCatching {
+            apiService.uploadSyncEvents(
+                SyncEventBatchRequest(events = pending.map { it.toDto() })
+            )
+            syncEventDao.markUploaded(pending.map { it.eventId })
+        }
+        // Silent fail — events stay in local buffer if upload fails
+    }
+}
+```
+
+---
+
+### 21.7 Backend Ingest Endpoint
+
+Lightweight, fire-and-forget. Backend never returns errors that block the client.
+
+```
+POST /v1/sync-events
+Authorization: Bearer <session_token>
+Content-Type: application/json
+
+{
+  "events": [
+    {
+      "event_id":       "uuid-v4",
+      "rider_id":       "R456",
+      "event_type":     "RETRY_EXHAUSTED",
+      "severity":       "CRITICAL",
+      "shipment_id":    "SHP123",
+      "action_id":      "uuid-A1",
+      "pending_count":  7,
+      "retry_count":    5,
+      "error_code":     "INVALID_TRANSITION",
+      "error_message":  "Cannot transition DELIVERED → PICKED_UP",
+      "device_info":    "{\"manufacturer\":\"Xiaomi\",\"model\":\"Redmi Note 11\",...}",
+      "network_type":   "MOBILE",
+      "battery_level":  34,
+      "free_storage_mb": 412,
+      "occurred_at":    1709123456789
+    }
+  ]
+}
+
+Response: 202 Accepted   ← always 202, never 4xx/5xx that would block client
+{
+  "received": 1,
+  "dropped":  0           ← backend may drop malformed events silently
+}
+```
+
+**Why always 202?** The client must never retry event logging uploads
+aggressively. If the backend is down, events stay in local buffer. A 500 should
+not cause the client to abandon the buffer or enter retry loops that drain battery.
+
+---
+
+### 21.8 SyncManager — Fully Instrumented
+
+The existing `SyncManager` from Section 6.3, now with event logging wired in
+at every failure point:
+
+```kotlin
+class SyncManager @Inject constructor(
+    private val journalDao: ActionJournalDao,
+    private val shipmentDao: ShipmentDao,
+    private val apiService: DeliveryApiService,
+    private val eventLogger: SyncEventLogger       // ← injected
+) {
+    private val mutex = Mutex()
+
+    suspend fun sync() = mutex.withLock {
+        val pending = journalDao.getPending(limit = 100)
+        if (pending.isEmpty()) return@withLock
+
+        pending.chunked(50).forEach { batch -> syncBatch(batch) }
+
+        // Log overall success after all batches complete
+        eventLogger.log(
+            eventType    = SyncEventType.SYNC_SUCCESS,
+            severity     = SyncEventSeverity.INFO,
+            pendingCount = journalDao.countPending()
+        )
+    }
+
+    private suspend fun syncBatch(batch: List<ActionJournalEntity>) {
+        val pendingSnapshot = journalDao.countPending()
+        journalDao.updateStatus(batch.map { it.actionId }, SyncStatus.IN_PROGRESS)
+
+        val response = try {
+            apiService.submitBatch(batch.map { it.toRequest() })
+        } catch (e: IOException) {
+            journalDao.resetToPending(batch.map { it.actionId })
+
+            // ── EVENT: network failure ────────────────────────────────
+            eventLogger.log(
+                eventType    = SyncEventType.SYNC_FAILED,
+                severity     = SyncEventSeverity.ERROR,
+                pendingCount = pendingSnapshot,
+                errorCode    = "NETWORK_IO",
+                errorMessage = e.message
+            )
+            return
+        } catch (e: HttpException) {
+            journalDao.resetToPending(batch.map { it.actionId })
+
+            // ── EVENT: HTTP error (5xx, 413, etc.) ───────────────────
+            eventLogger.log(
+                eventType    = when (e.code()) {
+                                   413  -> SyncEventType.PAYLOAD_TOO_LARGE
+                                   else -> SyncEventType.SYNC_FAILED
+                               },
+                severity     = SyncEventSeverity.ERROR,
+                pendingCount = pendingSnapshot,
+                errorCode    = e.code().toString(),
+                errorMessage = e.message()
+            )
+            return
+        }
+
+        var hadPartialFailure = false
+
+        response.results.forEach { result ->
+            when (result.status) {
+
+                "ACCEPTED", "ALREADY_PROCESSED" -> {
+                    journalDao.markSynced(result.actionId)
+                    // No event — success is the happy path, not worth logging per-record
+                }
+
+                "INVALID_TRANSITION" -> {
+                    journalDao.markFailed(result.actionId, result.error)
+                    hadPartialFailure = true
+
+                    // ── EVENT: state conflict ─────────────────────────
+                    eventLogger.log(
+                        eventType    = SyncEventType.CONFLICT,
+                        severity     = SyncEventSeverity.WARN,
+                        shipmentId   = result.shipmentId,
+                        actionId     = result.actionId,
+                        pendingCount = pendingSnapshot,
+                        errorCode    = "INVALID_TRANSITION",
+                        errorMessage = result.error
+                    )
+                }
+
+                "CLOCK_SKEW_REJECTED" -> {
+                    journalDao.resetToPending(listOf(result.actionId))
+
+                    // ── EVENT: clock skew ─────────────────────────────
+                    eventLogger.log(
+                        eventType    = SyncEventType.CLOCK_SKEW,
+                        severity     = SyncEventSeverity.WARN,
+                        actionId     = result.actionId,
+                        errorCode    = "CLOCK_SKEW",
+                        errorMessage = "Server time: ${result.serverTimeMs}, sent: ${result.receivedTimeMs}"
+                    )
+                }
+
+                "VERSION_CONFLICT" -> {
+                    hadPartialFailure = true
+
+                    // ── EVENT: optimistic lock mismatch ──────────────
+                    eventLogger.log(
+                        eventType    = SyncEventType.VERSION_CONFLICT,
+                        severity     = SyncEventSeverity.WARN,
+                        shipmentId   = result.shipmentId,
+                        actionId     = result.actionId,
+                        errorCode    = "VERSION_CONFLICT",
+                        errorMessage = "client v${result.clientVersion} server v${result.serverVersion}"
+                    )
+                }
+
+                "SIGNATURE_INVALID" -> {
+                    journalDao.markFailed(result.actionId, "Signature rejected")
+                    hadPartialFailure = true
+
+                    // ── EVENT: security — log with CRITICAL severity ──
+                    eventLogger.log(
+                        eventType    = SyncEventType.SIGNATURE_INVALID,
+                        severity     = SyncEventSeverity.CRITICAL,
+                        actionId     = result.actionId,
+                        errorCode    = "SIGNATURE_INVALID"
+                    )
+                }
+
+                "REASSIGNED" -> {
+                    journalDao.markFailed(result.actionId, "Task reassigned")
+
+                    // ── EVENT: reassignment during sync ───────────────
+                    eventLogger.log(
+                        eventType    = SyncEventType.REASSIGNED,
+                        severity     = SyncEventSeverity.WARN,
+                        shipmentId   = result.shipmentId,
+                        actionId     = result.actionId,
+                        errorCode    = "REASSIGNED"
+                    )
+                }
+
+                "SHIPMENT_NOT_FOUND" -> {
+                    journalDao.markFailed(result.actionId, "Shipment deleted on server")
+
+                    // ── EVENT: shipment deleted ───────────────────────
+                    eventLogger.log(
+                        eventType    = SyncEventType.DELETED,
+                        severity     = SyncEventSeverity.INFO,
+                        shipmentId   = result.shipmentId,
+                        actionId     = result.actionId
+                    )
+                }
+
+                else -> {
+                    val newRetryCount = journalDao.incrementRetry(result.actionId)
+                    hadPartialFailure = true
+
+                    if (newRetryCount >= MAX_RETRIES) {
+                        journalDao.markFailed(result.actionId, "Max retries exhausted")
+
+                        // ── EVENT: permanently failed ─────────────────
+                        eventLogger.log(
+                            eventType    = SyncEventType.RETRY_EXHAUSTED,
+                            severity     = SyncEventSeverity.CRITICAL,
+                            shipmentId   = result.shipmentId,
+                            actionId     = result.actionId,
+                            pendingCount = pendingSnapshot,
+                            retryCount   = newRetryCount,
+                            errorCode    = result.status,
+                            errorMessage = result.error
+                        )
+                    }
+                }
+            }
+        }
+
+        if (hadPartialFailure) {
+            // ── EVENT: batch partially failed ────────────────────────
+            eventLogger.log(
+                eventType    = SyncEventType.SYNC_PARTIAL,
+                severity     = SyncEventSeverity.WARN,
+                pendingCount = pendingSnapshot
+            )
+        }
+    }
+}
+```
+
+**Other instrumentation points outside SyncManager:**
+
+```kotlin
+// StartupRecoveryUseCase — stuck IN_PROGRESS entries
+class StartupRecoveryUseCase {
+    suspend fun execute() {
+        val stuckEntries = journalDao.getInProgress()
+        if (stuckEntries.isNotEmpty()) {
+            eventLogger.log(
+                eventType    = SyncEventType.STUCK_INPROGRESS,
+                severity     = SyncEventSeverity.WARN,
+                pendingCount = stuckEntries.size,
+                errorMessage = "Found ${stuckEntries.size} IN_PROGRESS entries on startup"
+            )
+            journalDao.resetInProgressToPending()
+        }
+    }
+}
+
+// SyncOrchestrator — offline buildup threshold
+class SyncOrchestrator {
+    suspend fun onActionRecorded() {
+        val pendingCount = journalDao.countPending()
+        if (pendingCount >= OFFLINE_BUILDUP_THRESHOLD && !connectivity.isOnline.value) {
+            eventLogger.log(
+                eventType    = SyncEventType.OFFLINE_BUILDUP,
+                severity     = if (pendingCount >= 20) SyncEventSeverity.WARN
+                               else SyncEventSeverity.INFO,
+                pendingCount = pendingCount,
+                errorMessage = "Rider offline with $pendingCount unsynced actions"
+            )
+        }
+    }
+}
+
+// PerformTaskActionUseCase — DB write failure
+class PerformTaskActionUseCase {
+    suspend fun execute(...): Result<Unit> {
+        return try {
+            withTransaction { /* ... */ }
+            Result.success(Unit)
+        } catch (e: SQLiteException) {
+            eventLogger.log(
+                eventType    = SyncEventType.DB_WRITE_FAILURE,
+                severity     = SyncEventSeverity.CRITICAL,
+                errorCode    = e.javaClass.simpleName,
+                errorMessage = e.message
+            )
+            Result.failure(e)
+        }
+    }
+}
+
+// SyncWorker — WorkManager retries exhausted
+class SyncWorker {
+    override suspend fun doWork(): Result {
+        return try {
+            syncManager.sync()
+            Result.success()
+        } catch (e: Exception) {
+            if (runAttemptCount >= MAX_WORKER_RETRIES) {
+                eventLogger.log(
+                    eventType    = SyncEventType.WORKER_EXHAUSTED,
+                    severity     = SyncEventSeverity.ERROR,
+                    errorCode    = e.javaClass.simpleName,
+                    errorMessage = "WorkManager retries exhausted after $runAttemptCount attempts"
+                )
+                Result.failure()
+            } else {
+                Result.retry()
+            }
+        }
+    }
+}
+```
+
+---
+
+### 21.9 Alerting Rules on Backend
+
+Backend processes the event stream and fires alerts based on rules.
+All alerts route to ops dashboard + PagerDuty/Slack.
+
+```
+Rule 1: RETRY_EXHAUSTED — immediate alert
+──────────────────────────────────────────
+Trigger:  Any RETRY_EXHAUSTED event received
+Severity: P2 (ops must investigate within 1 hour)
+Action:   Create ops ticket with rider_id, action_id, shipment_id, error_message
+Reason:   Data loss has occurred — action will never be replayed automatically
+
+Rule 2: OFFLINE_BUILDUP — delayed alert
+─────────────────────────────────────────
+Trigger:  Rider has OFFLINE_BUILDUP events and no SYNC_SUCCESS for > 2 hours
+Severity: P3 (investigate within 4 hours)
+Action:   Notify rider's hub manager + flag rider in ops dashboard
+Reason:   Rider may be stuck offline or app background sync broken
+
+Rule 3: SIGNATURE_INVALID — security alert
+───────────────────────────────────────────
+Trigger:  Any SIGNATURE_INVALID event
+Severity: P1 (immediate — possible fraud/tamper)
+Action:   Auto-suspend rider account, alert security team
+Reason:   Valid sessions should never produce invalid signatures
+
+Rule 4: STUCK_INPROGRESS — pattern alert
+─────────────────────────────────────────
+Trigger:  Same rider has STUCK_INPROGRESS on > 3 consecutive app launches
+Severity: P3
+Action:   Flag device for investigation (OEM kill pattern or crash loop)
+Reason:   Repeated crash/kill mid-sync → systemic issue on specific device model
+
+Rule 5: DB_WRITE_FAILURE — critical alert
+──────────────────────────────────────────
+Trigger:  Any DB_WRITE_FAILURE event
+Severity: P2
+Action:   Alert rider via FCM to restart app, ops creates ticket
+Reason:   Rider cannot record any new actions — workflow fully blocked
+
+Rule 6: SYNC_FAILED fleet pattern
+───────────────────────────────────
+Trigger:  > 5% of active riders have SYNC_FAILED in the same 10-min window
+Severity: P1 (likely backend issue, not rider issue)
+Action:   Page on-call backend engineer — possible API outage
+Reason:   Correlated failures across riders = server-side root cause
+
+Rule 7: WORKER_EXHAUSTED
+──────────────────────────
+Trigger:  WORKER_EXHAUSTED from same device manufacturer > 10 times/day
+Severity: P3
+Action:   Add manufacturer to OEM watchlist, review WorkManager config
+Reason:   Specific OEM killing WorkManager aggressively on this model
+```
+
+---
+
+### 21.10 Dashboard Metrics
+
+Derived from the sync event stream. Refreshed every 5 minutes.
+
+```
+Per-rider view:
+  ┌─────────────────────────────────────────────────────────┐
+  │  Rider R456 — Sync Health                               │
+  │  Last SYNC_SUCCESS:  12 minutes ago                     │
+  │  Pending actions:    3                                  │
+  │  Unresolved FAILEDs: 1  [View]                          │
+  │  Events today:       SYNC_SUCCESS×24, CONFLICT×1        │
+  │  Device:             Xiaomi Redmi Note 11, Android 13   │
+  │  Network:            MOBILE (last seen)                  │
+  └─────────────────────────────────────────────────────────┘
+
+Fleet view (10,000 riders):
+  ┌─────────────────────────────────────────────────────────┐
+  │  Sync Health — Fleet                                    │
+  │  Riders synced in last 30 min:   9,847 / 10,000  (98.5%)│
+  │  Riders with OFFLINE_BUILDUP:       47                  │
+  │  Riders with RETRY_EXHAUSTED today: 12   [View list]   │
+  │  CONFLICT rate today:            0.3% of actions        │
+  │  DB_WRITE_FAILURE today:            2 riders            │
+  │  SIGNATURE_INVALID today:           0 ✅                │
+  │  Top failure reason:             NETWORK_IO (68%)        │
+  └─────────────────────────────────────────────────────────┘
+
+Time-series charts:
+  - SYNC_SUCCESS rate (p50/p95 latency: created_at → synced_at)
+  - SYNC_FAILED count per 10-min bucket
+  - OFFLINE_BUILDUP count over time (spikes = network outage zones)
+  - RETRY_EXHAUSTED count per day (target: 0)
+  - Fleet PENDING action count (aggregate across all riders)
+```
+
+---
+
+### 21.11 Trade-offs of Event Logging
+
+| Aspect | Decision | Rationale |
+|---|---|---|
+| **Separate table from action_journal** | Yes — `sync_event_log` is its own table | Events must survive even if action_journal is partially corrupt |
+| **Separate uploader from SyncManager** | Yes — `SyncEventUploader` is independent | If SyncManager is broken, events still get through |
+| **Always 202 from backend** | Yes | Client must never retry aggressively or abandon buffer on server error |
+| **runCatching in SyncEventLogger.log()** | Yes | Event logging must never crash the app or surface to rider |
+| **7-day local retention for uploaded events** | Yes | Debugging window; events uploaded to server are the canonical source |
+| **200-event upload batch limit** | Yes | Caps payload size; deeply offline riders may accumulate 1000s of events |
+| **No logging of SYNC_SUCCESS per-record** | Intentional | Happy-path is too noisy; one SYNC_SUCCESS per sync cycle is enough |
+| **CRITICAL events logged synchronously** | Yes — DB write before returning | RETRY_EXHAUSTED and DB_WRITE_FAILURE must be captured even if app crashes next |
+| **Battery/storage in every event** | Yes | Enables correlation: "SYNC_FAILEDs cluster when battery < 20%" |
+| **Device info in every event** | Yes | Enables fleet segmentation: "Xiaomi devices have 3× more WORKER_EXHAUSTED" |
+
+---
+
+## 22. Testing Plan & Phased Release
+
+### 22.1 What to Test and Why
+
+Three layers. Each layer has a different job:
+
+```
+Unit tests        → logic is correct in isolation
+                    Fast. Run on every commit. No device needed.
+
+Integration tests → components work together correctly
+                    Room + SyncManager + StateMachine wired up.
+                    Run on emulator. Catch wiring bugs unit tests miss.
+
+E2E tests         → full user flow works on a real device
+                    Slow. Run on PR merge and before release.
+                    Catch what integration tests miss: OEM kills,
+                    real network, WorkManager timing.
+```
+
+---
+
+### 22.2 Unit Tests
+
+One test class per use case / component. No Android framework dependencies — pure JVM, fast.
+
+| Component | What to test | Key assertions |
+|---|---|---|
+| `ShipmentStateMachine` | Every valid transition allowed | `ASSIGNED → PICKED_UP` = true |
+| | Every invalid transition blocked | `DELIVERED → PICKED_UP` = false |
+| | All terminal states are final | No outbound transitions from DELIVERED/FAILED/CANCELLED |
+| `QrStructuralValidator` | Valid SHP- format passes | Returns `Pass` with shipmentId |
+| | Foreign QR rejected with correct type | URL → `FOREIGN_QR_URL`, UPI → `FOREIGN_QR_PAYMENT` |
+| | Checksum failure detected | Garbled suffix → `DAMAGED_QR` |
+| | Duplicate in session caught | Same ID twice → `DUPLICATE_SCAN` |
+| `AdaptiveSyncScheduler` | Correct tier from PENDING age | age=0 → NONE, age=10min → BACKSTOP |
+| | Battery constraint relaxed only when appropriate | age>2hr + count>20 → no battery constraint |
+| `NtpTimeProvider` | Returns device time + offset | offset=+5000ms → currentTimeMs is ahead |
+| | Falls back to persisted offset when server unreachable | Mock server throws → uses DB value |
+| `SyncEventLogger` | Never throws even if DB write fails | Simulated SQLiteException → no crash |
+| | Truncates error message at 512 chars | 600-char message → stored as 512 |
+| `EmergencyCleanupManager` | Pass 1 deletes only images | Image files gone, DB records intact |
+| | Never deletes PENDING journal entries | PENDING entry present → record untouched |
+| `ActionJournalDao` (Room in-memory) | `oldestPendingAgeMs` returns null when empty | Empty table → null |
+| | Sequence ordering preserved | 3 actions → returned in sequence_number ASC order |
+
+```kotlin
+// Example: StateMachine unit test
+@Test fun `DELIVERED cannot transition to PICKED_UP`() {
+    val machine = ShipmentStateMachine()
+    assertFalse(machine.canTransition(ShipmentState.Delivered, ShipmentAction.PickUp))
+}
+
+// Example: QR validator
+@Test fun `checksum mismatch returns DAMAGED_QR`() {
+    val result = QrStructuralValidator.validate("SHP-A1B2C3D4E5-9", emptySet())
+    assertEquals(QrRejectionReason.DAMAGED_QR, (result as QrStructuralResult.Reject).reason)
+}
+```
+
+**Coverage target: 80% line coverage on all use case and domain classes.**
+Generated code (DAOs, Hilt modules) excluded.
+
+---
+
+### 22.3 Integration Tests
+
+Run on Android emulator (API 30+). Use real Room (in-memory), fake Retrofit, real WorkManager test utilities.
+
+| Scenario | Setup | Assert |
+|---|---|---|
+| Offline action → sync on reconnect | Insert PENDING journal entry. Simulate network. Fire SyncManager. | Entry = SYNCED. Shipment state updated. |
+| Crash mid-sync recovery | Set 2 entries IN_PROGRESS. Call `StartupRecoveryUseCase`. | Both reset to PENDING. |
+| Partial batch failure | Mock server returns ACCEPTED for A1, INVALID_TRANSITION for A2. | A1 = SYNCED, A2 = FAILED, A3 stays PENDING (sequence dependency). |
+| Emergency cleanup Pass 1 | Insert 5 SYNCED terminal shipments with image paths. Call `EmergencyCleanupManager`. | Image files deleted. DB records intact. |
+| Adaptive scheduler tier change | Insert PENDING entry. Advance fake clock past AGE_STUCK. Call `reschedule()`. | WorkManager has BACKSTOP work enqueued. |
+| Captive portal detection | Mock `/v1/ping` returns 302. Mock google.com returns 200. Call `probe()`. | State = OFFLINE. `BACKEND_UNREACHABLE` event logged. |
+| Sequence ordering in batch | Insert A1, A3, A2 out of order for same shipment. Build batch. | Batch contains A1, A2, A3 in sequence order. |
+| DB cleanup eligibility | Mix of PENDING and SYNCED terminal entries. Run `DbCleanupWorker`. | Only SYNCED terminal entries older than 2 days deleted. PENDING untouched. |
+
+```kotlin
+// Example: sync recovery integration test
+@Test fun `IN_PROGRESS entries reset to PENDING on startup`() = runTest {
+    journalDao.insert(entry(status = IN_PROGRESS))
+    journalDao.insert(entry(status = IN_PROGRESS))
+
+    StartupRecoveryUseCase(journalDao, shipmentDao).execute()
+
+    val pending = journalDao.getPending()
+    assertEquals(2, pending.size)
+}
+```
+
+---
+
+### 22.4 E2E Tests
+
+Run on physical device (Xiaomi Redmi Note 11 + Samsung Galaxy A series — top OEM kill offenders). Use real WorkManager. Use a dedicated staging backend.
+
+| Flow | Steps | Assert |
+|---|---|---|
+| **Full delivery offline** | Enable airplane mode → mark PICKED_UP → OUT_FOR_DELIVERY → DELIVERED → restore network | All 3 actions synced. Server state = DELIVERED. |
+| **QR wrong parcel** | Scan a foreign QR (URL) | Instant rejection toast. Camera stays open. No DB write. |
+| **QR correct parcel, wrong rider** | Scan parcel assigned to Rider B while logged in as Rider A | `WRONG_RIDER` modal shown. No task created. Audit log entry written. |
+| **OEM background kill** | Start sync. Force-kill app via OEM battery settings. Reopen. | IN_PROGRESS entries reset. Sync resumes. No duplicates on server. |
+| **Captive portal** | Connect to Wi-Fi hotspot with no internet. Open app. | `CAPTIVE_PORTAL` banner shown. Sync does not attempt. |
+| **Storage pressure** | Fill device to < 100MB free. Open app. | CRITICAL banner shown. Image capture blocked. Emergency cleanup fires. |
+| **Adaptive T4 escalation** | Go offline. Perform 3 actions. Wait 6 minutes without opening app. | WorkManager BACKSTOP job fired. Entries remain PENDING (no network). No crash. |
+| **Reinstall recovery** | Perform 2 deliveries offline. Uninstall. Reinstall. Login. | Server recovery endpoint returns 2 in-progress shipments. UI shows review screen. |
+
+**Device matrix:**
+
+```
+Device                  Android   Priority   Why
+──────────────────────────────────────────────────────────
+Xiaomi Redmi Note 11    12        P0         Top OEM kill offender, high rider usage
+Samsung Galaxy A23      13        P0         Second most common rider device
+OnePlus Nord CE         11        P1         OPPO/OEM battery optimisation variant
+Stock Android emulator  14        P1         Clean baseline for CI
+```
+
+**E2E test runner:** Maestro (YAML-based, no Espresso boilerplate, works across OEMs without accessibility service setup).
+
+```yaml
+# Example Maestro flow: offline delivery
+- launchApp
+- tapOn: "Airplane Mode"         # via test helper
+- tapOn: "SHP-A1B2C3D4E5"
+- tapOn: "Mark Picked Up"
+- assertVisible: "Sync Pending"
+- tapOn: "Mark Delivered"
+- tapOn: "Airplane Mode Off"
+- waitForAnimationToEnd
+- assertVisible: "Synced ✓"
 ```
